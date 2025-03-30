@@ -414,7 +414,7 @@ def main():
 
     # Save integrated data to a JSON file
     print("Saving integrated data...")
-    with open("integrated_data.json", "w") as f:
+    with open("../../data/integrated_data.json", "w") as f:
         json.dump(integrated_data, f, indent=4)
 
     print("Complete")

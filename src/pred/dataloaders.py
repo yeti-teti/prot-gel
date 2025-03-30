@@ -1,12 +1,4 @@
-import functools
-import os
-from typing import List, Optional, Tuple, Dict, Union
-
-import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
-
-from pred.dataset import ProteinDataset
 
 def collate_fn(batch):
     """Pad sequences and residue features to the maximum length in the batch."""

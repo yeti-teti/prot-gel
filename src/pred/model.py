@@ -53,15 +53,6 @@ class ProtProp(nn.Module):
         combined = torch.cat([cnn_out, protein_out], dim=1)  # [batch, total_dim]
         logits = self.classifier(combined)  # [batch, 1]
         return logits
-
-    def save_checkpoint(self, path, optimizer, epoch, step):
-        """Save model checkpoint"""
-        torch.save({
-            'epoch': epoch,
-            'step': step,
-            'model_state_dict': self.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-        }, path)
     
     def load_from_checkpoint(path, config):
         """Load model from checkpoint."""
