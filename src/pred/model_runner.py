@@ -379,4 +379,72 @@ class ModelRunner:
         self.logger.info(f"Starting prediction on data: [green]{pred_input_path}[/]")
 
         # Load original data to get IDs
+        try:
+            with open(pred_input_path, 'r') as f:
+                original_data_dict = json.load(f)
+            protein_ids = list(original_data_dict.keys())
+        except Exception as e:
+            self.logger.error(f"Failed to load original data IDs")
+            protein_ids = None
+
+        try:
+            pred_dataset = ProteinDataset(json_path=pred_input_path, is_train=False, mean_std=self.mean_std)
+        except Exception as e:
+             self.logger.error(f"Failed to load prediction dataset: {e}", exc_info=True)
+             raise
         
+        # Check if number of items loaded by dataset mathces no. of Ids
+        if protein_ids and len(pred_dataset) != len(protein_ids):
+            self.logger.warning(f"Mismatch between number of entries in JSON ({len(protein_ids)}) and processed by Dataset ({len(pred_dataset)}). IDs in output might be incorrect.")
+            protein_ids = [f"Protein_{i}" for i in range(len(pred_dataset))]
+        
+        loader = DataLoader(pred_dataset, batch_size=self.config.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=self.config.get('num_workers', 0))
+        self.logger.info(f"Prediction set size: {len(pred_dataset)}")
+
+        self.model.eval()
+        predictions = []
+
+        progress = Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            console=self.console
+        )
+
+        with progress:
+            pred_task = progress.add_task("[yellow]Predicting", total=len(loader))
+
+            with torch.no_grad():
+                for batch in loader:
+                    sequence = batch['sequqence'].to(self.device)
+                    residue_features = batch['residue_features'].to(self.device)
+                    protein_features = batch['protein_features'].to(self.device)
+
+                    logits = self.model(sequence, residue_features, protein_features)
+                    probs = torch.sigmoid(logits.squeeze(1)).cpu().numpy()
+                    predictions.extend(probs)
+                    progress.update(pred_task, advance=1)
+        
+        self.logger.info("PRedictions finised")
+
+        # Save
+        if self.output_path:
+            output_dir = os.path.join(self.output_path, out_file)
+            try:
+                with open(output_dir, 'w') as f:
+                    f.write("ID\tGelation_Probability\n")
+                    # Ensure we have the correct number of IDs
+                    ids_to_write = protein_ids if protein_ids and len(protein_ids) == len(predictions) else [f"Protein_{i}" for i in range(len(predictions))]
+                    if not protein_ids or len(protein_ids) != len(predictions):
+                        self.logger.warning("Using generic IDs (Protein_i) due to loading issues or count mismatch.")
+
+                    for i, prob in enumerate(predictions):
+                        f.write(f"{ids_to_write[i]}\t{prob:.4f}\n")
+                self.logger.info(f"Saved predictions to: [green]{output_dir}[/]")
+            except Exception as e:
+                 self.logger.error(f"Failed to save predictions to {output_dir}: {e}", exc_info=True)
+
+        return predictions # Optionally return predictions list
+
+        
+
