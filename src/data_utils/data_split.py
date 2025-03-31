@@ -1,106 +1,114 @@
-import json
 import argparse
 import gc
 import os
+import sys
 import time
+import json
 
 import numpy as np
+import pandas as pd
+
 import torch
 from transformers import AutoTokenizer, AutoModel
 
-# Import necessary clustering algorithms
-from sklearn.cluster import AgglomerativeClustering
-from sklearn.cluster import DBSCAN
-# KMeans is not imported as it's not an option in the final argparse
+import dask.dataframe as dd
+import pyarrow.fs as pafs
+from dotenv import load_dotenv
+
+from sklearn.cluster import AgglomerativeClustering, DBSCAN
 from sklearn.model_selection import train_test_split
 
-# Helper functions
-def load_data_from_json(json_filepath):
-    """
-        Load data from file.
 
-        Returns:
-            - sequence data: List of tuples [(id1, seq1), ...]
-            - original_data_map: Dict mapping ID -> original feature dictionary
+# --- Configuration & R2 Setup ---
+ENV_FILE_PATH = ".env"
+# R2 Path for the INPUT dataset (MUST match db_writer.py output)
+DEFAULT_R2_INPUT_DIR = "integrated_data/viridiplantae_dataset_partitioned"
+# Default R2 Paths for the OUTPUT train/test Parquet datasets
+DEFAULT_R2_TRAIN_DIR = "integrated_data/train_split_parquet"
+DEFAULT_R2_TEST_DIR = "integrated_data/test_split_parquet"
+
+
+def setup_r2_fs(env_path=ENV_FILE_PATH):
     """
-    print(f"Loading data from {json_filepath}") # Corrected typo
+        Loads R2 credentials and returns bucket_name, storage_options for Dask
+    """
+    print(f"Loading R2 credentials from: {env_path}")
+    if not load_dotenv(dotenv_path=env_path):
+        print(f"Warning: .env file not found at {env_path}")
+
+    access_key = os.getenv("CLOUDFARE_ACCESS_KEY")
+    secret_key = os.getenv("CLOUDFARE_SECRET_KEY")
+    account_id = os.getenv("CLOUDFARE_ACCOUNT_ID")
+    bucket_name = os.getenv("CLOUDFARE_BUCKET_NAME")
+    endpoint = os.getenv("CLOUDFARE_ENDPOINT")
+
+    if not endpoint and account_id:
+        endpoint = f"https://{account_id}.r2.cloudflarestorage.com"
+
+    if not all([access_key, secret_key, bucket_name, endpoint]):
+        print("ERROR: Missing Cloudflare R2 credentials/config in environment/.env")
+        sys.exit(1)
+
+    print(f"Using R2 Endpoint: {endpoint}, Bucket: {bucket_name}")
+    storage_options = {'key': access_key, 'secret': secret_key, 'endpoint_url': endpoint}
+    
     try:
-        with open(json_filepath, "r") as f:
-            data = json.load(f)
+        fs = pafs.S3FileSystem(**storage_options)
+        fs.ls(bucket_name)
+        print("R2 connection successful.")
+    except Exception as e:
+        print(f"ERROR: Failed to connect or list R2 bucket '{bucket_name}': {e}")
+        sys.exit(1)
 
-        if not isinstance(data, dict):
-            raise ValueError("JSON data should be a dictionary")
+    return bucket_name, storage_options
 
+# Helper functions
+# Reading only (ID/Sequence initially)
+def load_data_from_parquet(r2_bucket, r2_dataset_path, storage_options):
+    """
+        Loads sequence data (ID, Sequence) from R2 Parquet using Dask for embedding.
+        Also returns the lazy full Dask DataFrame for later subset saving.
+    """
+    full_dataset_uri = f"r2://{r2_bucket}/{r2_dataset_path}"
+    print(f"Initializing Dask Dataframe from: {full_dataset_uri}")
+    try:
+        # Create the lazy Dask DataFrame for the full dataset
+        # Read all columns eventually needed
+        all_columns = ['uniprot_id', 'sequence', 'sequence_length', 'organism', 'taxonomy_id',
+                       'physicochemical_properties', 'aa_composition', 'residue_features',
+                       'structural_features', 'domains', 'gelation', 'uniprot_id_prefix']
+        ddf_full = dd.read_parquet(full_dataset_uri, storage_options=storage_options, columns=all_columns)
+        print(f"Full Dask Dataframe created with {ddf_full.npartitions} partitions.")
+
+        # Extract only ID and sequence for embeddings
+        print("Reading 'uniprot_id' and 'sequence' columns for embedding...")
+        ddf_seq = ddf_full[['uniprot_id', 'sequence']].copy()
+        df_seq_pd = ddf_seq.compute()
+        print(f"Loaded {len(df_seq_pd)} sequences into memory")
+
+        # Validate and format Sequence Data
         sequence_data = []
-        original_data_map = {}
-        count = 0
         invalid_entries = 0
-
-        # Iterate through the IDs
-        for item_id, item_data in data.items():
-            count += 1
-            if not isinstance(item_data, dict):
-                print(f"Warning: Value for ID '{item_id}' is not dict, skipping")
-                invalid_entries += 1
-                continue
-            if 'sequence' not in item_data:
-                print(f"Warning: Sequence not present for '{item_id}', skipping")
-                invalid_entries += 1
-                continue
-
-            sequence = item_data['sequence']
+        for _, row in df_seq_pd.iterrows():
+            item_id, sequence = row['uniprot_id'], row['sequence']
             if not isinstance(sequence, str):
-                print(f"Warning: Invalid sequence type (not string) for ID: '{item_id}', skipping") 
                 invalid_entries += 1
                 continue
-
             sequence_cleaned = "".join(sequence.split()).upper()
             if not sequence_cleaned:
-                print(f"Warning: Empty sequence after cleaning for ID '{item_id}', skipping") 
                 invalid_entries += 1
                 continue
-
-            # Uniprot ID as identifier
             sequence_data.append((item_id, sequence_cleaned))
-            # Store the original feature dictionary
-            original_data_map[item_id] = item_data 
-
+        
         processed_count = len(sequence_data)
-        print(f"Processed {count} entries from JSON")
-        if invalid_entries > 0:
-            print(f"Skipped {invalid_entries} invalid entries")
-        if processed_count == 0:
-            print("Error: No valid sequence entries found") 
-            exit(1)
+        if invalid_entries > 0: print(f"Skipped {invalid_entries} invalid/empty sequences.")
+        if processed_count == 0: print("Error: No valid sequences found."); sys.exit(1)
 
-        print(f"Successfully loaded {processed_count} valid sequence entries")
-        return sequence_data, original_data_map
+        print(f"Prepared {processed_count} sequences for embedding.")
+        return sequence_data, ddf_full
 
-    except FileNotFoundError:
-        print(f"Error: Input file not found at {json_filepath}")
-        exit(1)
-    except json.JSONDecodeError:
-        print(f"Error: Could not decode JSON from {json_filepath}")
-        exit(1)
-    except ValueError as e:
-        print(f"Error: Data format validation failed - {e}")
-        exit(1)
-    except Exception as e:
-        print(f"An unexpected error occurred during loading: {e}")
-        exit(1)
-
-def save_data_dict_to_json(data_dict, json_filepath):
-    """
-        Saves a dict (ID -> features) to JSON file.
-    """
-    print(f"Saving {len(data_dict)} entries to {json_filepath}...") 
-    try:
-        with open(json_filepath, 'w') as f:
-            json.dump(data_dict, f, indent=4)
-        print("Saved complete.") 
-    except Exception as e:
-        print(f"Error: Could not save data to {json_filepath}: {e}")
-        exit(1)
+    except ImportError: print("ERROR: Dask/PyArrow missing."); sys.exit(1)
+    except Exception as e: print(f"ERROR loading Dask/Parquet: {e}"); sys.exit(1)
 
 # ESM Model loading
 def load_esm_model(model_name="facebook/esm2_t33_650M_UR50D"):
@@ -345,177 +353,129 @@ def cluster_embeddings(embeddings, method, n_clusters=50, **kwargs):
     return labels
 
 # Data splitting
-def split_data_by_clusters(processed_ids, original_data_map, cluster_labels, test_split_ratio, random_seed=42):
-    """
-        Splits the original data (from original_data_map) based on clustering assignments
-        Returns train_data_dict and test_data_dict (dict mapping ID -> features)
-    """
-    if len(processed_ids) != len(cluster_labels):
-        raise ValueError("Mismatch between number of processed IDs and cluster labels.")
+def split_data_by_clusters(processed_ids, cluster_labels, test_split_ratio, random_seed=42):
+    # (Same as previous version - Code omitted for brevity)
+    if len(processed_ids) != len(cluster_labels): raise ValueError("Mismatch IDs vs labels.")
 
-    # Filter out noise points (label -1) before splitting clusters
-    valid_indices = [i for i, label in enumerate(cluster_labels) if label != -1]
-    valid_labels = [cluster_labels[i] for i in valid_indices]
-    # valid_processed_ids = [processed_ids[i] for i in valid_indices] # Not needed directly
+    valid_points = [(processed_ids[i], label) for i, label in enumerate(cluster_labels) if label != -1]
+    num_noise_points = len(processed_ids) - len(valid_points)
+    if num_noise_points > 0: print(f"\nNote: {num_noise_points} noise points excluded from split.")
+    if not valid_points: print("Error: No valid points remaining."); return [], []
 
-    num_valid_points = len(valid_indices)
-    num_noise_points = len(processed_ids) - num_valid_points
-
-    if num_noise_points > 0:
-        print(f"\nNote: {num_noise_points} noise points (label -1) were excluded from train/test split.")
-
-    if num_valid_points == 0:
-        print("Error: No valid points remaining after excluding noise. Cannot split.")
-        return {}, {} # Return empty dicts
-
-
-    num_unique_labels = len(set(valid_labels))
-    print(f"\n Splitting data based on {num_unique_labels} clusters (using {num_valid_points} non-noise points)...")
-
-    # Group valid original indices by their cluster label
     clusters_by_label = {}
-    for i, label in enumerate(valid_labels): # Iterate through valid labels
-        original_index = valid_indices[i]    # Get the original index corresponding to this valid point
-        if label not in clusters_by_label:
-            clusters_by_label[label] = []
-        clusters_by_label[label].append(original_index) # Store ORIGINAL index from processed_ids
+    for seq_id, label in valid_points:
+        if label not in clusters_by_label: clusters_by_label[label] = []
+        clusters_by_label[label].append(seq_id)
 
-    # Get list of clusters, where each cluster contains original indices from processed_ids/embeddings
-    cluster_list_of_indices = list(clusters_by_label.values())
+    cluster_list_of_ids = list(clusters_by_label.values())
+    num_unique_clusters = len(cluster_list_of_ids)
+    print(f"\nSplitting data based on {num_unique_clusters} clusters ({len(valid_points)} points)...")
 
-    if len(cluster_list_of_indices) < 2:
-        print("Warning: Only <= 1 cluster found among non-noise points. Cannot split into train/test. Returning all valid data as training set.")
-        train_indices_flat = [idx for cluster in cluster_list_of_indices for idx in cluster]
-        test_indices_flat = []
-        num_train_clusters = len(cluster_list_of_indices)
-        num_test_clusters = 0
+    if num_unique_clusters < 2:
+        print("Warning: Only <= 1 cluster. All valid data in training set.")
+        train_ids = [seq_id for cluster in cluster_list_of_ids for seq_id in cluster]
+        test_ids = []
+        num_train_clusters, num_test_clusters = num_unique_clusters, 0
     else:
-        # Split the clusters
         train_clusters, test_clusters = train_test_split(
-            cluster_list_of_indices,
-            test_size=test_split_ratio,
-            random_state=random_seed
+            cluster_list_of_ids, test_size=test_split_ratio, random_state=random_seed)
+        train_ids = [seq_id for cluster in train_clusters for seq_id in cluster]
+        test_ids = [seq_id for cluster in test_clusters for seq_id in cluster]
+        num_train_clusters, num_test_clusters = len(train_clusters), len(test_clusters)
+
+    print(f"Train set: {len(train_ids)} sequences from {num_train_clusters} clusters.")
+    print(f"Test set:  {len(test_ids)} sequences from {num_test_clusters} clusters.")
+    return train_ids, test_ids
+
+# Saving subsets
+def save_subset_to_parquet(id_list, ddf_full, storage_options, r2_bucket, output_r2_path):
+    """
+    Filters the full Dask DataFrame for the given IDs and saves the subset
+    as a new Parquet dataset on R2 using Dask's `to_parquet`.
+    """
+    output_uri = f"r2://{r2_bucket}/{output_r2_path}" # Use r2:// scheme
+
+    if not id_list:
+        print(f"Skipping save to {output_uri}: ID list is empty.")
+        return
+
+    print(f"\nPreparing to save {len(id_list)} entries to Parquet dataset: {output_uri}")
+    print(f"  Filtering Dask DataFrame...")
+    try:
+        # Ensure IDs are strings for filtering if 'uniprot_id' is string type
+        id_list_str = [str(id_val) for id_val in id_list]
+        subset_ddf = ddf_full[ddf_full['uniprot_id'].isin(id_list_str)].copy()
+
+        # Check if the filtered DataFrame is empty before writing
+        has_data = len(subset_ddf.head(1)) > 0
+        if not has_data:
+             print(f"  Warning: Filtered subset for {output_uri} is empty. No data to save.")
+             return
+
+        # For parallel writing
+        print(f"  Writing subset Parquet dataset to {output_uri}...")
+        start_write = time.time()
+        subset_ddf.to_parquet(
+            output_uri,
+            storage_options=storage_options,
+            write_index=False, 
+            overwrite=True,
         )
-        # Flatten lists to get original indices relative to the processed_ids list
-        train_indices_flat = [idx for cluster in train_clusters for idx in cluster]
-        test_indices_flat = [idx for cluster in test_clusters for idx in cluster]
-        num_train_clusters = len(train_clusters)
-        num_test_clusters = len(test_clusters)
+        end_write = time.time()
+        print(f"  Parquet dataset saved successfully. Took {end_write - start_write:.2f}s.")
 
-    # Output dictionaries
-    train_data_dict = {}
-    test_data_dict = {}
-    missing_in_original = 0
-
-    # Adding to train dict
-    for idx in train_indices_flat:
-        if idx >= len(processed_ids): # Sanity check against original list length
-            print(f"Warning: Train index {idx} out of bounds for processed_ids (len {len(processed_ids)}). Skipping.") # Corrected print
-            continue
-        seq_id = processed_ids[idx]
-        original_item = original_data_map.get(seq_id)
-        if original_item:
-               train_data_dict[seq_id] = original_item
-        else:
-            missing_in_original += 1
-            print(f"Warning: ID '{seq_id}' from train split not found in original_data_map.")
-
-    # Adding to test dict
-    for idx in test_indices_flat:
-        if idx >= len(processed_ids): # Sanity check
-            print(f"Warning: Test index {idx} out of bounds for processed_ids (len {len(processed_ids)}). Skipping.") # Corrected print
-            continue
-        seq_id = processed_ids[idx]
-        original_item = original_data_map.get(seq_id)
-        if original_item:
-            test_data_dict[seq_id] = original_item
-        else:
-            missing_in_original += 1
-            print(f"Warning: ID '{seq_id}' from test split not found in original_data_map.")
-
-    if missing_in_original > 0:
-        print(f"Total Warning Count: {missing_in_original} IDs from clustering step were not found in the original data map during split assignment.")
-
-    print(f"Train set: {len(train_data_dict)} sequences from {num_train_clusters} clusters.")
-    print(f"Test set:  {len(test_data_dict)} sequences from {num_test_clusters} clusters.") # Corrected spacing
-
-    return train_data_dict, test_data_dict # Return dictionaries
+    except Exception as e:
+        print(f"ERROR during subset filtering or Parquet writing for {output_uri}: {e}")
+     
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="""
-        Splits protein sequence data (from integrated JSON dictionary) into training
-        and testing sets based on ESM embedding clusters using Hugging Face Transformers.
-        """) 
+        Splits protein sequence data (read from R2 Parquet) into training/testing
+        Parquet datasets based on ESM embedding clusters.
+        """)
 
-    parser.add_argument('-i', '--input', type=str, required=True,
-                        help='Input integrated JSON file (dictionary: ID -> features).')
-    parser.add_argument('--train_out', type=str, default='train_set_integrated.json',
-                        help='Output file for the training set (JSON dictionary). Default: train_set_integrated.json')
-    parser.add_argument('--test_out', type=str, default='test_set_integrated.json',
-                        help='Output file for the testing set (JSON dictionary). Default: test_set_integrated.json')
-    parser.add_argument('--esm_model', type=str, default='facebook/esm2_t33_650M_UR50D',
-                        help='Hugging Face identifier of the pre-trained ESM model to use (e.g., facebook/esm2_t33_650M_UR50D). Default: facebook/esm2_t33_650M_UR50D')
-    parser.add_argument('--batch_size', type=int, default=32,
-                        help='Batch size for ESM embedding generation. Adjust based on GPU memory. Default: 32')
-    parser.add_argument('--max_len', type=int, default=1022,
-                         help='Maximum sequence length (residues) BEFORE tokenization. Longer sequences truncated. Default: 1022')
-
-
-    # Clustering Args
-    parser.add_argument('--cluster_method', type=str, default='dbscan', choices=['dbscan', 'agglomerative'],
-                        help="Clustering algorithm ('dbscan', 'agglomerative'). Default: dbscan")
-    parser.add_argument('--eps', type=float, default=0.5, 
-                        help='DBSCAN eps parameter (max distance between samples for neighborhood). Needs tuning. Default: 0.5')
-    parser.add_argument('--min_samples', type=int, default=5,
-                        help='DBSCAN min_samples parameter (number of samples in neighborhood). Default: 5')
-    parser.add_argument('--distance_threshold', type=float, default=None,
-                         help='Distance threshold ONLY for Agglomerative clustering (overrides --n_clusters if set). Uses cosine distance. Try values like 0.6-1.0.')
-    parser.add_argument('--n_clusters', type=int, default=50,
-                        help='Number of clusters target ONLY for AgglomerativeClustering when distance_threshold is not set. Default: 50')
-
-    # Common args
-    parser.add_argument('--test_ratio', type=float, default=0.2,
-                        help='Proportion of non-noise clusters to allocate to the test set. Default: 0.2')
-    parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed for train/test split reproducibility. Default: 42') # Removed mention of clustering seed
+    # IO Arguments
+    parser.add_argument('--r2_input_path', type=str, default=DEFAULT_R2_INPUT_DIR,
+                        help=f'Path to the INPUT partitioned Parquet dataset directory within the R2 bucket. Default: {DEFAULT_R2_INPUT_DIR}')
+    parser.add_argument('--r2_train_path', type=str, default=DEFAULT_R2_TRAIN_DIR,
+                        help=f'Path for the OUTPUT training Parquet dataset directory within the R2 bucket. Default: {DEFAULT_R2_TRAIN_DIR}')
+    parser.add_argument('--r2_test_path', type=str, default=DEFAULT_R2_TEST_DIR,
+                        help=f'Path for the OUTPUT testing Parquet dataset directory within the R2 bucket. Default: {DEFAULT_R2_TEST_DIR}')
     parser.add_argument('--embeddings_out', type=str, default=None,
-                        help='Optional: File path to save the generated embeddings (numpy .npy format).')
+                        help='Optional: File path to save generated embeddings (numpy .npy format).')
     parser.add_argument('--ids_out', type=str, default=None,
-                         help='Optional: File path to save the list of IDs corresponding to the embeddings (text file).')
+                        help='Optional: File path to save list of IDs corresponding to embeddings (text file).')
+
+    # ESM Arguments
+    parser.add_argument('--esm_model', type=str, default='facebook/esm2_t33_650M_UR50D', help='HF ESM model identifier.')
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for ESM.')
+    parser.add_argument('--max_len', type=int, default=1022, help='Max sequence length for ESM.')
+
+    # Clustering Arguments
+    parser.add_argument('--cluster_method', type=str, default='dbscan', choices=['dbscan', 'agglomerative'], help="Clustering algorithm.")
+    parser.add_argument('--eps', type=float, default=0.5, help='DBSCAN eps.')
+    parser.add_argument('--min_samples', type=int, default=5, help='DBSCAN min_samples.')
+    parser.add_argument('--distance_threshold', type=float, default=None, help='Agglomerative distance threshold.')
+    parser.add_argument('--n_clusters', type=int, default=50, help='Agglomerative n_clusters.')
+
+    # Splitting Arguments
+    parser.add_argument('--test_ratio', type=float, default=0.2, help='Proportion of clusters for test set.')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for splitting.')
 
     args = parser.parse_args()
 
-    # Input validation
-    if not 0.0 < args.test_ratio < 1.0:
-        print("Error: Test split ratio must be between 0.0 and 1.0 (exclusive)")
-        exit(1)
-    # Clustering specific validation
-    if args.cluster_method == 'agglomerative':
-        if args.distance_threshold is None and args.n_clusters <= 0:
-            print("Error: For Agglomerative, must provide positive --n_clusters OR positive --distance_threshold.")
-            exit(1)
-        if args.distance_threshold is not None and args.distance_threshold <= 0:
-             print("Error: --distance_threshold must be positive for Agglomerative clustering.")
-             exit(1)
-    # DBSCAN validation
-    if args.cluster_method == 'dbscan':
-        if args.eps <= 0:
-            print("Error: --eps must be positive for DBSCAN.")
-            exit(1)
-        if args.min_samples <= 0:
-            print("Error: --min_samples must be positive for DBSCAN.")
-            exit(1)
+    # --- Input Validation ---
+    if not 0.0 < args.test_ratio < 1.0: print("Error: Test ratio invalid."); sys.exit(1)
+    if args.batch_size <= 0: print("Error: batch_size invalid."); sys.exit(1)
+    if args.max_len <= 0: print("Error: max_len invalid."); sys.exit(1)
+    # Add detailed clustering param validation if needed
 
-    # Other validation
-    if args.batch_size <= 0:
-         print("Error: batch_size must be positive.")
-         exit(1)
-    if args.max_len <= 0:
-         print("Error: max_len must be positive.")
-         exit(1)
+    # --- Workflow ---
+    # 0. Setup R2 connection
+    r2_bucket, storage_options = setup_r2_fs(ENV_FILE_PATH)
 
-    # 1. Load data
-    sequence_data, original_data_map = load_data_from_json(args.input)
+    # 1. Load sequence data and get full Dask DataFrame
+    sequence_data, ddf_full = load_data_from_parquet(r2_bucket, args.r2_input_path, storage_options)
 
     # 2. Load ESM Model
     model, tokenizer, layer_repr, device = load_esm_model(args.esm_model)
@@ -524,51 +484,30 @@ if __name__ == "__main__":
     embeddings, processed_ids, _ = generate_embeddings(
         model, tokenizer, sequence_data, args.batch_size, layer_repr, args.max_len, device=device
     )
+    if embeddings.shape[0] == 0: print("Error: No embeddings generated."); sys.exit(1)
+    if len(processed_ids) != embeddings.shape[0]: print("Error: Mismatch embeddings vs IDs."); sys.exit(1)
 
-    if embeddings.shape[0] == 0:
-         print("Error: No embeddings were generated. Exiting.")
-         exit(1)
-    if len(processed_ids) != embeddings.shape[0]:
-         print(f"Error: Mismatch between number of embeddings ({embeddings.shape[0]}) and processed IDs ({len(processed_ids)}).")
-         exit(1)
-
-    # 4. Save embeddings and IDs
-    if args.embeddings_out:
-        print(f"Saving embeddings to {args.embeddings_out}...")
-        np.save(args.embeddings_out, embeddings)
+    # 4. Save embeddings/IDs (Optional)
+    if args.embeddings_out: print(f"Saving embeddings to {args.embeddings_out}..."); np.save(args.embeddings_out, embeddings)
     if args.ids_out:
-         print(f"Saving corresponding IDs to {args.ids_out}...")
-         with open(args.ids_out, 'w') as f:
-              for seq_id in processed_ids:
-                   f.write(str(seq_id) + '\n')
+        print(f"Saving corresponding IDs to {args.ids_out}...")
+        with open(args.ids_out, 'w') as f:
+            for seq_id in processed_ids: f.write(str(seq_id) + '\n')
 
     # 5. Cluster embeddings
     cluster_params = {}
     if args.cluster_method == 'agglomerative':
-        # Pass n_clusters and distance_threshold, let the function prioritize
-        cluster_params['n_clusters'] = args.n_clusters
-        cluster_params['distance_threshold'] = args.distance_threshold
+        cluster_params['n_clusters'] = args.n_clusters; cluster_params['distance_threshold'] = args.distance_threshold
     elif args.cluster_method == 'dbscan':
-        cluster_params['eps'] = args.eps
-        cluster_params['min_samples'] = args.min_samples
+        cluster_params['eps'] = args.eps; cluster_params['min_samples'] = args.min_samples
+    cluster_labels = cluster_embeddings(embeddings, method=args.cluster_method, **cluster_params)
 
-    cluster_labels = cluster_embeddings(
-        embeddings,
-        method=args.cluster_method,
-        **cluster_params
-    )
+    # 6. Split IDs based on clusters
+    train_ids, test_ids = split_data_by_clusters(processed_ids, cluster_labels, args.test_ratio, args.seed)
 
-    # 6. Split data based on clusters
-    train_data_dict, test_data_dict = split_data_by_clusters(
-        processed_ids,           # List of IDs corresponding to embeddings
-        original_data_map,       # Map ID -> original dict
-        cluster_labels,          # Labels from clustering step
-        args.test_ratio,
-        args.seed                # Seed for train/test split consistency
-    )
-
-    # 7. Save output datasets
-    save_data_dict_to_json(train_data_dict, args.train_out)
-    save_data_dict_to_json(test_data_dict, args.test_out)
+    # 7. Save output datasets by filtering Dask DF and writing Parquet subsets
+    # Ensure ddf_full is available here
+    save_subset_to_parquet(train_ids, ddf_full, storage_options, r2_bucket, args.r2_train_path)
+    save_subset_to_parquet(test_ids, ddf_full, storage_options, r2_bucket, args.r2_test_path)
 
     print("\nCompleted.")
