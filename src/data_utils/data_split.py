@@ -12,6 +12,7 @@ import torch
 from transformers import AutoTokenizer, AutoModel
 
 import dask.dataframe as dd
+import s3fs
 import pyarrow.fs as pafs
 from dotenv import load_dotenv
 
@@ -22,7 +23,7 @@ from sklearn.model_selection import train_test_split
 # --- Configuration & R2 Setup ---
 ENV_FILE_PATH = ".env"
 # R2 Path for the INPUT dataset (MUST match db_writer.py output)
-DEFAULT_R2_INPUT_DIR = "integrated_data/viridiplantae_dataset_partitioned"
+DEFAULT_R2_INPUT_DIR = "integrated_data/viridiplantae_dataset_partitioned_from_json"
 # Default R2 Paths for the OUTPUT train/test Parquet datasets
 DEFAULT_R2_TRAIN_DIR = "integrated_data/train_split_parquet"
 DEFAULT_R2_TEST_DIR = "integrated_data/test_split_parquet"
@@ -53,7 +54,8 @@ def setup_r2_fs(env_path=ENV_FILE_PATH):
     storage_options = {'key': access_key, 'secret': secret_key, 'endpoint_url': endpoint}
     
     try:
-        fs = pafs.S3FileSystem(**storage_options)
+        print("Testing R2 connection using s3fs")
+        fs = s3fs.S3FileSystem(**storage_options)
         fs.ls(bucket_name)
         print("R2 connection successful.")
     except Exception as e:
@@ -69,7 +71,7 @@ def load_data_from_parquet(r2_bucket, r2_dataset_path, storage_options):
         Loads sequence data (ID, Sequence) from R2 Parquet using Dask for embedding.
         Also returns the lazy full Dask DataFrame for later subset saving.
     """
-    full_dataset_uri = f"r2://{r2_bucket}/{r2_dataset_path}"
+    full_dataset_uri = f"s3://{r2_bucket}/{r2_dataset_path}"
     print(f"Initializing Dask Dataframe from: {full_dataset_uri}")
     try:
         # Create the lazy Dask DataFrame for the full dataset
@@ -163,7 +165,6 @@ def generate_embeddings(model, tokenizer, sequence_data, batch_size=32, layer_re
     embeddings = []
     processed_ids = []
     truncated_ids = []
-    # device = next(model.parameters()).device # Device is now passed explicitly
     num_sequences = len(sequence_data)
     embed_dim = model.config.hidden_size # Get embedding dimension from model config
 
@@ -354,7 +355,6 @@ def cluster_embeddings(embeddings, method, n_clusters=50, **kwargs):
 
 # Data splitting
 def split_data_by_clusters(processed_ids, cluster_labels, test_split_ratio, random_seed=42):
-    # (Same as previous version - Code omitted for brevity)
     if len(processed_ids) != len(cluster_labels): raise ValueError("Mismatch IDs vs labels.")
 
     valid_points = [(processed_ids[i], label) for i, label in enumerate(cluster_labels) if label != -1]
@@ -393,7 +393,7 @@ def save_subset_to_parquet(id_list, ddf_full, storage_options, r2_bucket, output
     Filters the full Dask DataFrame for the given IDs and saves the subset
     as a new Parquet dataset on R2 using Dask's `to_parquet`.
     """
-    output_uri = f"r2://{r2_bucket}/{output_r2_path}" # Use r2:// scheme
+    output_uri = f"s3://{r2_bucket}/{output_r2_path}"
 
     if not id_list:
         print(f"Skipping save to {output_uri}: ID list is empty.")

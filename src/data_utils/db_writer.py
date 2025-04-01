@@ -23,13 +23,14 @@ BASE_DATA_DIR = "../../data"
 UNIPROT_FILE = "uniprotkb_viridiplantae.txt"
 PFAM_HMM_FILE = "Pfam-A.hmm"
 HMMSCAN_OUT_FILE = "pfam_results.tbl"
-COMPLETE_PDB_DIR = "complete_pdb" 
-INTEGRATED_JSON_PATH = "integrated_data.json" # FINAL OUTPUT
+COMPLETE_PDB_DIR = "complete_pdb_test" 
+INTEGRATED_JSON_FILE = "integrated_data.json" # FINAL OUTPUT
 
 UNIPROT_PATH = os.path.join(BASE_DATA_DIR, "sequence_databases", "uniprot", UNIPROT_FILE)
 HMM_PATH = os.path.join(BASE_DATA_DIR, "sequence_databases", "pfam", PFAM_HMM_FILE)
 HMMSCAN_OUTPUT = os.path.join(BASE_DATA_DIR, "sequence_databases", "pfam", HMMSCAN_OUT_FILE)
 COMPLETE_PDB_FOLDER_PATH = os.path.join(BASE_DATA_DIR, "structure_databases", COMPLETE_PDB_DIR)
+OUTPUT_PATH = os.path.join(BASE_DATA_DIR, INTEGRATED_JSON_FILE)
 
 
 # External tool paths
@@ -82,7 +83,6 @@ def parse_record(record_lines):
     return record_data
 
 def compute_physicochemical_properties(sequence):
-    # (Keep original function - unchanged)
     default_props = {"molecular_weight": 0.0, "aromaticity": 0.0, "instability_index": 0.0,
                      "isoelectric_point": 0.0, "gravy": 0.0, "charge_at_pH_7": 0.0}
     if not isinstance(sequence, str) or not sequence: return default_props
@@ -105,14 +105,12 @@ def compute_physicochemical_properties(sequence):
 
 
 def compute_aa_composition(sequence):
-    # (Keep original function - unchanged)
     if not sequence: return {}
-    count = Counter(sequence); total = len(sequence)
+    count = Counter(sequence)
+    total = len(sequence)
     return {aa: c / total for aa, c in count.items()}
 
 def compute_residue_features(sequence):
-    # (Keep original function - unchanged)
-    # Ensure default values are JSON serializable (e.g., 0.0)
     if not sequence: return []
     return [{'hydrophobicity': hydrophobicity.get(aa, 0.0),
              'polarity': polarity.get(aa, 0.0),
@@ -120,7 +118,6 @@ def compute_residue_features(sequence):
 
 
 def parse_swissprot_file(file_path):
-    # (Keep original function - unchanged, ensure path is correct)
     print(f"Parsing UniProt data from: {file_path}...")
     swissprot_data = {}
     if not os.path.exists(file_path):
@@ -139,7 +136,8 @@ def parse_swissprot_file(file_path):
                         if uniprot_id and sequence:
                             tax_id = re.search(r"NCBI_TaxID=(\d+)", record.get("OX", ""))
                             swissprot_data[uniprot_id] = {
-                                "sequence": sequence, "sequence_length": len(sequence),
+                                "sequence": sequence, 
+                                "sequence_length": len(sequence),
                                 "organism": record.get("OS", "Unknown"),
                                 "taxonomy_id": tax_id.group(1) if tax_id else None,
                                 "physicochemical_properties": compute_physicochemical_properties(sequence),
@@ -542,16 +540,15 @@ def main():
 
 
     # Step 5: Save Final Integrated Data to JSON
-    # (Replaces Step 7 - Parquet/R2)
     print(f"\n--- Saving Integrated Data to JSON ---")
     if not integrated_data:
          print("ERROR: No integrated data produced. Skipping JSON save.")
     else:
-         print(f"Saving integrated data ({len(integrated_data)} entries) to {INTEGRATED_JSON_PATH}...")
+         print(f"Saving integrated data ({len(integrated_data)} entries) to {OUTPUT_PATH}...")
          try:
              # Ensure parent directory exists
-             os.makedirs(os.path.dirname(INTEGRATED_JSON_PATH), exist_ok=True)
-             with open(INTEGRATED_JSON_PATH, "w") as f:
+             os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+             with open(OUTPUT_PATH, "w") as f:
                   json.dump(integrated_data, f, indent=2)
              print("Integrated data saved successfully.")
          except TypeError as e:

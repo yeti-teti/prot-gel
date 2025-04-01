@@ -156,7 +156,7 @@ def main():
             root_path=full_dataset_uri,
             partition_cols=['uniprot_id_prefix'],
             filesystem=r2_fs,
-            use_threads=True, # Enable multi-threaded writing
+            use_threads=False, # Enable multi-threaded writing
             existing_data_behavior='overwrite_or_ignore' # Overwrite if exists, good for reruns
         )
         write_end_time = time.time()
