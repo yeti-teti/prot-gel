@@ -1,3 +1,5 @@
+# Get only viridiplantae pdb from alphafold
+
 import os
 import re
 import shutil
