@@ -46,23 +46,7 @@ DATA_SCHEMA = pa.schema([
         pa.field('isoelectric_point', pa.float64(), nullable=True),
         pa.field('molecular_weight', pa.float64(), nullable=True)
     ]), nullable=True),
-
-    # AA Composition Struct
-    pa.field('aa_composition', pa.struct([
-        pa.field('A', pa.float64(), nullable=True), pa.field('B', pa.null(), nullable=True),
-        pa.field('C', pa.float64(), nullable=True), pa.field('D', pa.float64(), nullable=True),
-        pa.field('E', pa.float64(), nullable=True), pa.field('F', pa.float64(), nullable=True),
-        pa.field('G', pa.float64(), nullable=True), pa.field('H', pa.float64(), nullable=True),
-        pa.field('I', pa.float64(), nullable=True), pa.field('K', pa.float64(), nullable=True),
-        pa.field('L', pa.float64(), nullable=True), pa.field('M', pa.float64(), nullable=True),
-        pa.field('N', pa.float64(), nullable=True), pa.field('P', pa.float64(), nullable=True),
-        pa.field('Q', pa.float64(), nullable=True), pa.field('R', pa.float64(), nullable=True),
-        pa.field('S', pa.float64(), nullable=True), pa.field('T', pa.float64(), nullable=True),
-        pa.field('U', pa.null(), nullable=True), pa.field('V', pa.float64(), nullable=True),
-        pa.field('W', pa.float64(), nullable=True), pa.field('X', pa.null(), nullable=True),
-        pa.field('Y', pa.float64(), nullable=True), pa.field('Z', pa.null(), nullable=True)
-    ]), nullable=True),
-
+ 
     # Residue Features List
     pa.field('residue_features', pa.list_(pa.struct([
         pa.field('hydrophobicity', pa.float64(), nullable=True),

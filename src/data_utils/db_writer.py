@@ -104,12 +104,6 @@ def compute_physicochemical_properties(sequence):
         return {k: (v if np.isfinite(v) else None) for k, v in default_props.items()}
 
 
-def compute_aa_composition(sequence):
-    if not sequence: return {}
-    count = Counter(sequence)
-    total = len(sequence)
-    return {aa: c / total for aa, c in count.items()}
-
 def compute_residue_features(sequence):
     if not sequence: return []
     return [{'hydrophobicity': hydrophobicity.get(aa, 0.0),
@@ -141,7 +135,6 @@ def parse_swissprot_file(file_path):
                                 "organism": record.get("OS", "Unknown"),
                                 "taxonomy_id": tax_id.group(1) if tax_id else None,
                                 "physicochemical_properties": compute_physicochemical_properties(sequence),
-                                "aa_composition": compute_aa_composition(sequence),
                                 "residue_features": compute_residue_features(sequence),
                                 "structural_features": [], # To be populated later
                                 "domains": [] # To be populated later
@@ -358,7 +351,7 @@ def process_pdb_file(pdb_filepath, dssp_exec):
                                   for i, (a, c) in enumerate(zip(ca_atoms, ca_coords_np))]
                 tree = KDTree(ca_coords_np)
                 pairs = list(tree.query_pairs(r=CONTACT_THRESHOLD))
-                contact_map_indices = pairs # List of (index1, index2) tuples
+                contact_map_indices = [{"idx": i1, "idx2": i2} for i1, i2 in pairs] 
 
             structural_feature["ca_coordinates"] = ca_coordinates
             structural_feature["contact_map_indices_ca"] = contact_map_indices
