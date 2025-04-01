@@ -13,7 +13,7 @@ from transformers import AutoTokenizer, AutoModel
 
 import dask.dataframe as dd
 import s3fs
-import pyarrow.fs as pafs
+import pyarrow as pa
 from dotenv import load_dotenv
 
 from sklearn.cluster import AgglomerativeClustering, DBSCAN
@@ -28,6 +28,108 @@ DEFAULT_R2_INPUT_DIR = "integrated_data/viridiplantae_dataset_partitioned_from_j
 DEFAULT_R2_TRAIN_DIR = "integrated_data/train_split_parquet"
 DEFAULT_R2_TEST_DIR = "integrated_data/test_split_parquet"
 
+# Pyarrow schema for output
+DATA_SCHEMA = pa.schema([
+    # Basic Info
+    pa.field('uniprot_id', pa.large_string(), nullable=True),
+    pa.field('sequence', pa.large_string(), nullable=True),
+    pa.field('sequence_length', pa.int64(), nullable=True),
+    pa.field('organism', pa.large_string(), nullable=True),
+    pa.field('taxonomy_id', pa.large_string(), nullable=True),
+
+    # Physicochemical Properties Struct
+    pa.field('physicochemical_properties', pa.struct([
+        pa.field('aromaticity', pa.float64(), nullable=True),
+        pa.field('charge_at_pH_7', pa.float64(), nullable=True),
+        pa.field('gravy', pa.float64(), nullable=True),
+        pa.field('instability_index', pa.float64(), nullable=True),
+        pa.field('isoelectric_point', pa.float64(), nullable=True),
+        pa.field('molecular_weight', pa.float64(), nullable=True)
+    ]), nullable=True),
+
+    # AA Composition Struct
+    pa.field('aa_composition', pa.struct([
+        pa.field('A', pa.float64(), nullable=True), pa.field('B', pa.null(), nullable=True),
+        pa.field('C', pa.float64(), nullable=True), pa.field('D', pa.float64(), nullable=True),
+        pa.field('E', pa.float64(), nullable=True), pa.field('F', pa.float64(), nullable=True),
+        pa.field('G', pa.float64(), nullable=True), pa.field('H', pa.float64(), nullable=True),
+        pa.field('I', pa.float64(), nullable=True), pa.field('K', pa.float64(), nullable=True),
+        pa.field('L', pa.float64(), nullable=True), pa.field('M', pa.float64(), nullable=True),
+        pa.field('N', pa.float64(), nullable=True), pa.field('P', pa.float64(), nullable=True),
+        pa.field('Q', pa.float64(), nullable=True), pa.field('R', pa.float64(), nullable=True),
+        pa.field('S', pa.float64(), nullable=True), pa.field('T', pa.float64(), nullable=True),
+        pa.field('U', pa.null(), nullable=True), pa.field('V', pa.float64(), nullable=True),
+        pa.field('W', pa.float64(), nullable=True), pa.field('X', pa.null(), nullable=True),
+        pa.field('Y', pa.float64(), nullable=True), pa.field('Z', pa.null(), nullable=True)
+    ]), nullable=True),
+
+    # Residue Features List
+    pa.field('residue_features', pa.list_(pa.struct([
+        pa.field('hydrophobicity', pa.float64(), nullable=True),
+        pa.field('polarity', pa.float64(), nullable=True),
+        pa.field('volume', pa.float64(), nullable=True)
+    ])), nullable=True),
+
+    # Structural features list
+    pa.field('structural_features', pa.list_(pa.struct([
+        pa.field("pdb_id", pa.string(), nullable=True),
+        pa.field("pdb_file", pa.string(), nullable=True),
+        pa.field("dbref_records", pa.list_(pa.struct([ # List of DBREF structs
+            pa.field("chain", pa.string(), nullable=True),
+            pa.field("accession", pa.string(), nullable=True),
+            pa.field("db_id_code", pa.string(), nullable=True),
+            pa.field("pdb_start_res", pa.int64(), nullable=True),
+            pa.field("pdb_end_res", pa.int64(), nullable=True),
+            pa.field("db_start_res", pa.int64(), nullable=True),
+            pa.field("db_end_res", pa.int64(), nullable=True)
+        ])), nullable=True),
+        pa.field("helix_percentage", pa.float64(), nullable=True),
+        pa.field("sheet_percentage", pa.float64(), nullable=True),
+        pa.field("coil_percentage", pa.float64(), nullable=True),
+        pa.field("total_residues_dssp", pa.int64(), nullable=True), 
+        pa.field("dssp_residue_details", pa.list_(pa.struct([ # List of DSSP residue structs
+            pa.field("chain", pa.string(), nullable=True),
+            pa.field("residue_seq", pa.int64(), nullable=True), # DSSP residue number
+            pa.field("residue_icode", pa.string(), nullable=True), # Insertion code
+            pa.field("amino_acid", pa.string(), nullable=True), # One-letter code
+            pa.field("secondary_structure", pa.string(), nullable=True), # DSSP code (H, E, C etc)
+            pa.field("relative_accessibility", pa.float64(), nullable=True),
+            pa.field("phi", pa.float64(), nullable=True),
+            pa.field("psi", pa.float64(), nullable=True)
+        ])), nullable=True),
+        pa.field("ca_coordinates", pa.list_(pa.struct([ # List of CA coordinate structs
+             pa.field("index", pa.int64(), nullable=True), # Index in the CA list
+             pa.field("chain", pa.string(), nullable=True),
+             pa.field("residue_seq", pa.int64(), nullable=True),
+             pa.field("residue_icode", pa.string(), nullable=True),
+             pa.field("x", pa.float64(), nullable=True),
+             pa.field("y", pa.float64(), nullable=True),
+             pa.field("z", pa.float64(), nullable=True)
+        ])), nullable=True),
+        # Representing contact map as list of pairs (structs with two indices)
+        pa.field("contact_map_indices_ca", pa.list_(pa.struct([
+             pa.field("idx1", pa.int64(), nullable=True),
+             pa.field("idx2", pa.int64(), nullable=True)
+        ])), nullable=True),
+        pa.field("processing_error", pa.string(), nullable=True) # Record any errors
+    ])), nullable=True), # The outer list itself can be null
+
+    # Domains List
+    pa.field('domains', pa.list_(pa.struct([
+        pa.field('accession', pa.string(), nullable=True), pa.field('bias', pa.float64(), nullable=True),
+        pa.field('description', pa.string(), nullable=True), pa.field('end', pa.int64(), nullable=True),
+        pa.field('envelope_end', pa.int64(), nullable=True), pa.field('envelope_start', pa.int64(), nullable=True),
+        pa.field('evalue', pa.float64(), nullable=True), pa.field('hmm_end', pa.int64(), nullable=True),
+        pa.field('hmm_start', pa.int64(), nullable=True), pa.field('score', pa.float64(), nullable=True),
+        pa.field('start', pa.int64(), nullable=True), pa.field('target_name', pa.string(), nullable=True)
+    ])), nullable=True),
+
+    # Gelation prediction
+    pa.field('gelation', pa.large_string(), nullable=True),
+
+    # Partitioning Column
+    pa.field('uniprot_id_prefix', pa.dictionary(pa.int8(), pa.string(), ordered=False), nullable=True)
+])
 
 def setup_r2_fs(env_path=ENV_FILE_PATH):
     """
@@ -76,9 +178,8 @@ def load_data_from_parquet(r2_bucket, r2_dataset_path, storage_options):
     try:
         # Create the lazy Dask DataFrame for the full dataset
         # Read all columns eventually needed
-        all_columns = ['uniprot_id', 'sequence', 'sequence_length', 'organism', 'taxonomy_id',
-                       'physicochemical_properties', 'aa_composition', 'residue_features',
-                       'structural_features', 'domains', 'gelation', 'uniprot_id_prefix']
+        all_columns = [field.name for field in DATA_SCHEMA]
+
         ddf_full = dd.read_parquet(full_dataset_uri, storage_options=storage_options, columns=all_columns)
         print(f"Full Dask Dataframe created with {ddf_full.npartitions} partitions.")
 
@@ -388,7 +489,7 @@ def split_data_by_clusters(processed_ids, cluster_labels, test_split_ratio, rand
     return train_ids, test_ids
 
 # Saving subsets
-def save_subset_to_parquet(id_list, ddf_full, storage_options, r2_bucket, output_r2_path):
+def save_subset_to_parquet(id_list, ddf_full, storage_options, r2_bucket, output_r2_path, schema=DATA_SCHEMA):
     """
     Filters the full Dask DataFrame for the given IDs and saves the subset
     as a new Parquet dataset on R2 using Dask's `to_parquet`.
@@ -420,6 +521,7 @@ def save_subset_to_parquet(id_list, ddf_full, storage_options, r2_bucket, output
             storage_options=storage_options,
             write_index=False, 
             overwrite=True,
+            schema=schema
         )
         end_write = time.time()
         print(f"  Parquet dataset saved successfully. Took {end_write - start_write:.2f}s.")
@@ -506,8 +608,7 @@ if __name__ == "__main__":
     train_ids, test_ids = split_data_by_clusters(processed_ids, cluster_labels, args.test_ratio, args.seed)
 
     # 7. Save output datasets by filtering Dask DF and writing Parquet subsets
-    # Ensure ddf_full is available here
-    save_subset_to_parquet(train_ids, ddf_full, storage_options, r2_bucket, args.r2_train_path)
-    save_subset_to_parquet(test_ids, ddf_full, storage_options, r2_bucket, args.r2_test_path)
+    save_subset_to_parquet(train_ids, ddf_full, storage_options, r2_bucket, args.r2_train_path, schema=DATA_SCHEMA)
+    save_subset_to_parquet(test_ids, ddf_full, storage_options, r2_bucket, args.r2_test_path, schema=DATA_SCHEMA)
 
     print("\nCompleted.")
