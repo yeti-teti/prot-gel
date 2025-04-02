@@ -509,65 +509,72 @@ def split_data_by_clusters(processed_ids, cluster_labels, test_split_ratio, rand
 # Saving subsets
 def save_subset_to_parquet(id_list, df_full, r2_filesystem, r2_bucket, output_r2_path, schema=DATA_SCHEMA):
     """
-        Filters the full Pandas DataFrame for the given IDs and saves the subset
-        as a new Parquet dataset on R2 using PyArrow's `write_to_dataset`.
+    Filters the full Pandas DataFrame for the given IDs and saves the subset
+    as a new Parquet dataset on R2 using PyArrow's `write_to_dataset`.
     """
-    output_uri = f"s3://{r2_bucket}/{output_r2_path}"
+    # Path within the bucket (key) 
+    output_path_in_bucket = f"{r2_bucket}/{output_r2_path}" 
+    output_uri_display = f"s3://{output_path_in_bucket}"
 
     if not id_list:
-        print(f"Skipping save to {output_uri}: ID list is empty.")
+        print(f"Skipping save to {output_uri_display}: ID list is empty.")
         return
     if df_full is None or df_full.empty:
-        print(f"Skipping save to s3://{output_uri}: Full DataFrame is empty or None.")
+        print(f"Skipping save to {output_uri_display}: Full DataFrame is empty or None.")
         return
 
-    print(f"\nPreparing to save {len(id_list)} entries to Parquet dataset: s3://{output_uri}")
+    print(f"\nPreparing to save {len(id_list)} entries to Parquet dataset: {output_uri_display}")
     print(f"  Filtering Pandas DataFrame...")
     start_filter_write = time.time()
+    subset_table = None
     try:
         # Ensure IDs are strings for filtering if 'uniprot_id' is string type
         id_list_str = [str(id_val) for id_val in id_list]
         subset_df = df_full[df_full['uniprot_id'].isin(id_list_str)].copy()
 
         if subset_df.empty:
-            print(f"  Warning: Filtered subset for s3://{output_uri} is empty. No data to save.")
+            print(f"  Warning: Filtered subset for {output_uri_display} is empty. No data to save.")
             return
 
         print(f"  Filtered DataFrame shape: {subset_df.shape}")
         print(f"  Converting filtered Pandas subset to PyArrow Table...")
 
-        # Ensuring schema alignment before conversion
         # Add missing columns as None
         cols_to_add = []
-        for field in schema:
-            if field.name not in subset_df.columns:
-                subset_df[field.name] = None
-                cols_to_add.append(field.name)
+        final_cols_order = [field.name for field in schema]
+        for col_name in final_cols_order:
+             if col_name not in subset_df.columns:
+                subset_df[col_name] = None
+                cols_to_add.append(col_name)
         # Reordering columns to match schema
-        subset_df = subset_df[[field.name for field in schema]]
+        subset_df = subset_df[final_cols_order]
         if cols_to_add:
             print(f" Added missing columns: {cols_to_add}")
-        
+
         subset_table = pa.Table.from_pandas(subset_df, schema=schema, preserve_index=False)
         del subset_df
         gc.collect()
 
-        print(f"Writing subset PyArrow Table to Parquet")
+        print(f"Writing subset PyArrow Table to Parquet at {output_uri_display}") # Use display URI here is fine
         pq.write_to_dataset(
             subset_table,
-            root_path=output_uri,
+            root_path=output_path_in_bucket,
             schema=schema,
             filesystem=r2_filesystem,
-            use_threads=False,
+            use_threads=True,
             existing_data_behavior='overwrite_or_ignore'
         )
         end_filter_write = time.time()
         print(f"  Parquet dataset saved successfully. Filtering and writing took {end_filter_write - start_filter_write:.2f}s.")
-        del subset_table
-        gc.collect()
 
     except Exception as e:
-        print(f"ERROR during subset filtering or Parquet writing for {output_uri}: {e}")
+        # Provide the display URI in the error message for clarity
+        print(f"ERROR during subset filtering or Parquet writing for {output_uri_display}: {e}")
+    finally:
+        # Ensure table is deleted even on error
+        if subset_table is not None:
+            del subset_table
+        gc.collect()
      
 
 if __name__ == "__main__":
