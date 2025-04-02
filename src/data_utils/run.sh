@@ -1,7 +1,10 @@
 
 # Default
-python data_split.py
+# python data_split.py
 
+python data_split.py --esm_model facebook/esm2_t12_35M_UR50D --cluster_method dbscan --eps 0.2
+
+# python data_split.py --esm_model facebook/esm2_t12_35M_UR50D --cluster_method dbscan --eps 0.2 --min_samples 10
 
 # python data_split.py \
 #     --r2_input_path integrated_data/viridiplantae_dataset_partitioned \

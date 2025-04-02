@@ -559,7 +559,7 @@ def save_subset_to_parquet(id_list, df_full, r2_filesystem, r2_bucket, output_r2
             schema=schema,
             filesystem=r2_filesystem,
             use_threads=False,
-            existing_data_behaviours='overwrite_or_ignore'
+            existing_data_behavior='overwrite_or_ignore'
         )
         end_filter_write = time.time()
         print(f"  Parquet dataset saved successfully. Filtering and writing took {end_filter_write - start_filter_write:.2f}s.")
