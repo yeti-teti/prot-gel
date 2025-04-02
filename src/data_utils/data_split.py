@@ -11,9 +11,10 @@ import pandas as pd
 import torch
 from transformers import AutoTokenizer, AutoModel
 
-import dask.dataframe as dd
-import s3fs
 import pyarrow as pa
+import pyarrow.parquet as pq
+import pyarrow.fs as pafs
+
 from dotenv import load_dotenv
 
 from sklearn.cluster import AgglomerativeClustering, DBSCAN
@@ -45,8 +46,8 @@ DATA_SCHEMA = pa.schema([
         pa.field('instability_index', pa.float64(), nullable=True),
         pa.field('isoelectric_point', pa.float64(), nullable=True),
         pa.field('molecular_weight', pa.float64(), nullable=True)
-    ]), nullable=True),
- 
+    ]), nullable=True), 
+
     # Residue Features List
     pa.field('residue_features', pa.list_(pa.struct([
         pa.field('hydrophobicity', pa.float64(), nullable=True),
@@ -137,41 +138,67 @@ def setup_r2_fs(env_path=ENV_FILE_PATH):
         sys.exit(1)
 
     print(f"Using R2 Endpoint: {endpoint}, Bucket: {bucket_name}")
-    storage_options = {'key': access_key, 'secret': secret_key, 'endpoint_url': endpoint}
     
     try:
         print("Testing R2 connection using s3fs")
-        fs = s3fs.S3FileSystem(**storage_options)
-        fs.ls(bucket_name)
+        fs = pafs.S3FileSystem(
+            endpoint_override=endpoint,
+            access_key=access_key,
+            secret_key=secret_key,
+            scheme='https'
+        )
+        fs.get_file_info(bucket_name + "/")
         print("R2 connection successful.")
     except Exception as e:
         print(f"ERROR: Failed to connect or list R2 bucket '{bucket_name}': {e}")
         sys.exit(1)
 
-    return bucket_name, storage_options
+    return bucket_name, fs
 
 # Helper functions
 # Reading only (ID/Sequence initially)
-def load_data_from_parquet(r2_bucket, r2_dataset_path, storage_options):
+def load_data_from_parquet(r2_bucket, r2_dataset_path, r2_filesystem):
     """
-        Loads sequence data (ID, Sequence) from R2 Parquet using Dask for embedding.
-        Also returns the lazy full Dask DataFrame for later subset saving.
+        Loads the COMPLETE Parquet dataset from R2 into a Pandas DataFrame using PyArrow.
+        Extracts sequence data (ID, Sequence) for embedding.
+        Returns the sequence data list AND the full Pandas DataFrame.
     """
-    full_dataset_uri = f"s3://{r2_bucket}/{r2_dataset_path}"
-    print(f"Initializing Dask Dataframe from: {full_dataset_uri}")
+    full_dataset_uri = f"{r2_bucket}/{r2_dataset_path}"
+    print(f"Loading full dataset into memory")
+    
     try:
-        # Create the lazy Dask DataFrame for the full dataset
-        # Read all columns eventually needed
+        print("Creating PyArrow ParquetDataset object...")
+        dataset = pq.ParquetDataset(full_dataset_uri, filesystem=r2_filesystem)
+        print(f"Dataset object created")
+
+        # Columns needed
         all_columns = [field.name for field in DATA_SCHEMA]
 
-        ddf_full = dd.read_parquet(full_dataset_uri, storage_options=storage_options, columns=all_columns)
-        print(f"Full Dask Dataframe created with {ddf_full.npartitions} partitions.")
+        # Checking partitioning column in schema
+        actual_schema_cols = dataset.schema.names
+        columns_to_read = [col for col in all_columns if col in actual_schema_cols]
+        if 'uniprot_id_prefix' in all_columns and 'uniprot_id_prefix' not in actual_schema_cols:
+            print("Partitioning column not foudn in Parquet schema")
 
-        # Extract only ID and sequence for embeddings
-        print("Reading 'uniprot_id' and 'sequence' columns for embedding...")
-        ddf_seq = ddf_full[['uniprot_id', 'sequence']].copy()
-        df_seq_pd = ddf_seq.compute()
-        print(f"Loaded {len(df_seq_pd)} sequences into memory")
+        print(f"Reading specified columns ({len(columns_to_read)}) into memory...")
+        start_read = time.time()
+        # Read the entier dataset into PyArrow table then convert into Pandas DF
+        table_full = dataset.read(columns=columns_to_read)
+        df_full_pd = table_full.to_pandas()
+        
+        del table_full
+        gc.collect()
+        end_read = time.time()
+        print(f"Loaded full dataset into Pandas DataFrame with shape: {df_full_pd.shape}")
+        print(f"Data loading took {end_read - start_read:.2f} seconds.")
+
+        # Extracting only ID ans Sequence for embeddings
+        print("Extracting uniprot_id and sequence columns for embedding...")
+        if 'uniprot_id' not in df_full_pd.columns or 'sequence' not in df_full_pd.columns:
+            print("ERROR: 'uniprot_id' or 'sequence' column not found in loaded data.")
+            sys.exit(1)
+        
+        df_seq_pd = df_full_pd[['uniprot_id', 'sequence']].copy()
 
         # Validate and format Sequence Data
         sequence_data = []
@@ -188,14 +215,20 @@ def load_data_from_parquet(r2_bucket, r2_dataset_path, storage_options):
             sequence_data.append((item_id, sequence_cleaned))
         
         processed_count = len(sequence_data)
+        processed_count = len(sequence_data)
         if invalid_entries > 0: print(f"Skipped {invalid_entries} invalid/empty sequences.")
         if processed_count == 0: print("Error: No valid sequences found."); sys.exit(1)
 
         print(f"Prepared {processed_count} sequences for embedding.")
-        return sequence_data, ddf_full
 
-    except ImportError: print("ERROR: Dask/PyArrow missing."); sys.exit(1)
-    except Exception as e: print(f"ERROR loading Dask/Parquet: {e}"); sys.exit(1)
+        return sequence_data, df_full_pd
+    
+    except MemoryError:
+        print("Ran out of memory")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error loading Parquet data: {e}")
+        sys.exit(1)
 
 # ESM Model loading
 def load_esm_model(model_name="facebook/esm2_t33_650M_UR50D"):
@@ -303,9 +336,9 @@ def generate_embeddings(model, tokenizer, sequence_data, batch_size=32, layer_re
                 # Getting hidden states
                 outputs = model(**inputs, output_hidden_states=True)
             except Exception as e:
-                 print(f"\nError during model inference (Batch {i//batch_size + 1}). Problematic IDs might be: {batch_ids}")
-                 print(f"Error: {e}")
-                 continue # Skip batch on error
+                print(f"\nError during model inference (Batch {i//batch_size + 1}). Problematic IDs might be: {batch_ids}")
+                print(f"Error: {e}")
+                continue # Skip batch on error
 
         # Extract hidden states for the specified layer
         if not (0 <= layer_repr < len(outputs.hidden_states)):
@@ -440,6 +473,7 @@ def cluster_embeddings(embeddings, method, n_clusters=50, **kwargs):
 
 # Data splitting
 def split_data_by_clusters(processed_ids, cluster_labels, test_split_ratio, random_seed=42):
+
     if len(processed_ids) != len(cluster_labels): raise ValueError("Mismatch IDs vs labels.")
 
     valid_points = [(processed_ids[i], label) for i, label in enumerate(cluster_labels) if label != -1]
@@ -473,42 +507,64 @@ def split_data_by_clusters(processed_ids, cluster_labels, test_split_ratio, rand
     return train_ids, test_ids
 
 # Saving subsets
-def save_subset_to_parquet(id_list, ddf_full, storage_options, r2_bucket, output_r2_path, schema=DATA_SCHEMA):
+def save_subset_to_parquet(id_list, df_full, r2_filesystem, r2_bucket, output_r2_path, schema=DATA_SCHEMA):
     """
-    Filters the full Dask DataFrame for the given IDs and saves the subset
-    as a new Parquet dataset on R2 using Dask's `to_parquet`.
+        Filters the full Pandas DataFrame for the given IDs and saves the subset
+        as a new Parquet dataset on R2 using PyArrow's `write_to_dataset`.
     """
     output_uri = f"s3://{r2_bucket}/{output_r2_path}"
 
     if not id_list:
         print(f"Skipping save to {output_uri}: ID list is empty.")
         return
+    if df_full is None or df_full.empty:
+        print(f"Skipping save to s3://{output_uri}: Full DataFrame is empty or None.")
+        return
 
-    print(f"\nPreparing to save {len(id_list)} entries to Parquet dataset: {output_uri}")
-    print(f"  Filtering Dask DataFrame...")
+    print(f"\nPreparing to save {len(id_list)} entries to Parquet dataset: s3://{output_uri}")
+    print(f"  Filtering Pandas DataFrame...")
+    start_filter_write = time.time()
     try:
         # Ensure IDs are strings for filtering if 'uniprot_id' is string type
         id_list_str = [str(id_val) for id_val in id_list]
-        subset_ddf = ddf_full[ddf_full['uniprot_id'].isin(id_list_str)].copy()
+        subset_df = df_full[df_full['uniprot_id'].isin(id_list_str)].copy()
 
-        # Check if the filtered DataFrame is empty before writing
-        has_data = len(subset_ddf.head(1)) > 0
-        if not has_data:
-             print(f"  Warning: Filtered subset for {output_uri} is empty. No data to save.")
-             return
+        if subset_df.empty:
+            print(f"  Warning: Filtered subset for s3://{output_uri} is empty. No data to save.")
+            return
 
-        # For parallel writing
-        print(f"  Writing subset Parquet dataset to {output_uri}...")
-        start_write = time.time()
-        subset_ddf.to_parquet(
-            output_uri,
-            storage_options=storage_options,
-            write_index=False, 
-            overwrite=True,
-            schema=schema
+        print(f"  Filtered DataFrame shape: {subset_df.shape}")
+        print(f"  Converting filtered Pandas subset to PyArrow Table...")
+
+        # Ensuring schema alignment before conversion
+        # Add missing columns as None
+        cols_to_add = []
+        for field in schema:
+            if field.name not in subset_df.columns:
+                subset_df[field.name] = None
+                cols_to_add.append(field.name)
+        # Reordering columns to match schema
+        subset_df = subset_df[[field.name for field in schema]]
+        if cols_to_add:
+            print(f" Added missing columns: {cols_to_add}")
+        
+        subset_table = pa.Table.from_pandas(subset_df, schema=schema, preserve_index=False)
+        del subset_df
+        gc.collect()
+
+        print(f"Writing subset PyArrow Table to Parquet")
+        pq.write_to_dataset(
+            subset_table,
+            root_path=output_uri,
+            schema=schema,
+            filesystem=r2_filesystem,
+            use_threads=False,
+            existing_data_behaviours='overwrite_or_ignore'
         )
-        end_write = time.time()
-        print(f"  Parquet dataset saved successfully. Took {end_write - start_write:.2f}s.")
+        end_filter_write = time.time()
+        print(f"  Parquet dataset saved successfully. Filtering and writing took {end_filter_write - start_filter_write:.2f}s.")
+        del subset_table
+        gc.collect()
 
     except Exception as e:
         print(f"ERROR during subset filtering or Parquet writing for {output_uri}: {e}")
@@ -557,11 +613,16 @@ if __name__ == "__main__":
     # Add detailed clustering param validation if needed
 
     # --- Workflow ---
+    script_start_time = time.time()
+
     # 0. Setup R2 connection
-    r2_bucket, storage_options = setup_r2_fs(ENV_FILE_PATH)
+    r2_bucket, r2_filesystem = setup_r2_fs(ENV_FILE_PATH)
 
     # 1. Load sequence data and get full Dask DataFrame
-    sequence_data, ddf_full = load_data_from_parquet(r2_bucket, args.r2_input_path, storage_options)
+    sequence_data, df_full = load_data_from_parquet(r2_bucket, args.r2_input_path, r2_filesystem)
+    if df_full is None:
+        print("ERROR: Failed to load data, DataFrame is None.")
+        sys.exit(1)
 
     # 2. Load ESM Model
     model, tokenizer, layer_repr, device = load_esm_model(args.esm_model)
@@ -573,8 +634,15 @@ if __name__ == "__main__":
     if embeddings.shape[0] == 0: print("Error: No embeddings generated."); sys.exit(1)
     if len(processed_ids) != embeddings.shape[0]: print("Error: Mismatch embeddings vs IDs."); sys.exit(1)
 
+    # Clean up model and sequence data from memory if possible
+    del model, tokenizer, sequence_data
+    gc.collect()
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
+
     # 4. Save embeddings/IDs (Optional)
-    if args.embeddings_out: print(f"Saving embeddings to {args.embeddings_out}..."); np.save(args.embeddings_out, embeddings)
+    if args.embeddings_out: 
+        print(f"Saving embeddings to {args.embeddings_out}...")
+        np.save(args.embeddings_out, embeddings)
     if args.ids_out:
         print(f"Saving corresponding IDs to {args.ids_out}...")
         with open(args.ids_out, 'w') as f:
@@ -588,11 +656,24 @@ if __name__ == "__main__":
         cluster_params['eps'] = args.eps; cluster_params['min_samples'] = args.min_samples
     cluster_labels = cluster_embeddings(embeddings, method=args.cluster_method, **cluster_params)
 
+    # Clean up embeddings
+    del embeddings
+    gc.collect()
+
     # 6. Split IDs based on clusters
     train_ids, test_ids = split_data_by_clusters(processed_ids, cluster_labels, args.test_ratio, args.seed)
 
-    # 7. Save output datasets by filtering Dask DF and writing Parquet subsets
-    save_subset_to_parquet(train_ids, ddf_full, storage_options, r2_bucket, args.r2_train_path, schema=DATA_SCHEMA)
-    save_subset_to_parquet(test_ids, ddf_full, storage_options, r2_bucket, args.r2_test_path, schema=DATA_SCHEMA)
+    # Clean up labels and IDs
+    del cluster_labels, processed_ids
+    gc.collect()
 
+    # 7. Save output datasets by filtering Dask DF and writing Parquet subsets
+    save_subset_to_parquet(train_ids, df_full, r2_filesystem, r2_bucket, args.r2_train_path, schema=DATA_SCHEMA)
+    save_subset_to_parquet(test_ids, df_full, r2_filesystem, r2_bucket, args.r2_test_path, schema=DATA_SCHEMA)
+
+    # Final cleanup
+    del df_full, train_ids, test_ids
+    gc.collect()
+
+    script_end_time = time.time()
     print("\nCompleted.")

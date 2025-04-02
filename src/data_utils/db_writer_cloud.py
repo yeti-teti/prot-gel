@@ -2,6 +2,8 @@ import os
 import sys
 import json
 import time
+import math
+import gc
 
 import pandas as pd
 import numpy as np
@@ -20,6 +22,9 @@ INPUT_JSON_FILENAME = "integrated_data.json"
 ENV_FILE_PATH = ".env" # Assumes .env file in the script's directory
 # Target path WITHIN the R2 bucket
 R2_OUTPUT_DIR = "integrated_data/viridiplantae_dataset_partitioned_from_json" # Example path
+
+# Partitions for Dask Datframe
+N_PARTITIONS = max(1, os.cpu_count() // 2 if os.cpu_count() else 4)
 
 DATA_SCHEMA = pa.schema([
     # Basic Info
@@ -138,6 +143,13 @@ elif not r2_endpoint and not r2_account_id:
      print("ERROR: Missing Cloudflare R2 endpoint or account ID (set CLOUDFARE_ENDPOINT or CLOUDFARE_ACCOUNT_ID).")
      sys.exit(1)
 
+# Create storage_options dictionary for Dask/s3fs
+storage_options = {
+    'key': r2_access_key,
+    'secret': r2_secret_key,
+    'endpoint_url': r2_endpoint,
+    'client_kwargs': {'endpoint_url': r2_endpoint} # Sometimes needed for s3fs
+}
 
 # Validate required R2 variables
 if not all([r2_access_key, r2_secret_key, r2_bucket_name, r2_endpoint]):
@@ -149,19 +161,24 @@ print(f"Target R2 Bucket:   {r2_bucket_name}")
 print(f"Target R2 Path:     {R2_OUTPUT_DIR}")
 
 
-def clean_nans_in_data(data):
+def preprocess_nans(data):
+    """Recursively replaces np.nan with None in nested lists/dicts."""
     if isinstance(data, dict):
-        return {k: clean_nans_in_data(v) for k, v in data.items()}
+        return {k: preprocess_nans(v) for k, v in data.items()}
     elif isinstance(data, list):
-        return [clean_nans_in_data(item) for item in data]
+        return [preprocess_nans(item) for item in data]
     elif isinstance(data, float) and np.isnan(data):
         return None
+    elif pd.isna(data):
+         return None
     return data
 
 # --- Main Execution ---
 def main():
     print("\n--- Starting JSON to R2 Parquet Upload Script ---")
+
     start_time = time.time()
+    initial_data_len = 0
 
     # 1. Check and Load Input JSON
     if not os.path.exists(input_json_path):
@@ -175,6 +192,7 @@ def main():
         if not integrated_data:
             print("ERROR: JSON file is empty or contains no data.")
             sys.exit(1)
+        initial_data_len = len(integrated_data)
         print(f"Successfully loaded {len(integrated_data)} records from JSON.")
     except json.JSONDecodeError as e:
         print(f"ERROR: Failed to decode JSON file: {e}")
@@ -185,94 +203,114 @@ def main():
 
 
     # 2. Convert JSON data to Pandas DataFrame
-    # Assumes JSON structure is {"uniprot_id": {feature_dict}}
     print("Converting JSON data to Pandas DataFrame...")
     try:
-        df = pd.DataFrame.from_dict(integrated_data, orient='index')
-        # Reset index to make 'uniprot_id' a column
-        df = df.reset_index().rename(columns={'index': 'uniprot_id'})
-        print(f"DataFrame created with shape: {df.shape}")
-        # Basic validation
+        data_list = []
+        for uniprot_id, data_dict in integrated_data.items():
+             if isinstance(data_dict, dict):
+                processed_dict = preprocess_nans(data_dict)
+                processed_dict['uniprot_id'] = uniprot_id
+                data_list.append(processed_dict)
+             else:
+                 print(f"Warning: Skipping entry for {uniprot_id} as it's not a dictionary.")
+
+        if not data_list:
+            print("ERROR: No valid dictionary entries found in the JSON data after processing.")
+            sys.exit(1)
+
+        df = pd.DataFrame(data_list)
+        df_shape = df.shape
+
+        print(f"Pandas DataFrame created with shape: {df_shape}")
         if 'uniprot_id' not in df.columns:
-             print("ERROR: 'uniprot_id' column not found after DataFrame conversion. Check JSON structure.")
+             print("ERROR: 'uniprot_id' column not found after DataFrame conversion. Check JSON structure and conversion logic.")
              sys.exit(1)
+        
+        del integrated_data
+        del data_list
+        gc.collect()
+
     except MemoryError:
-        print("\nERROR: Ran out of memory converting JSON to DataFrame.")
-        print("The JSON file might be too large for this machine's RAM.")
-        print("Consider processing the JSON in chunks or using a machine with more RAM.")
+        print("\nERROR: Ran out of memory converting JSON dictionary to Pandas DataFrame.")
         sys.exit(1)
     except Exception as e:
-        print(f"ERROR: Failed during JSON to DataFrame conversion: {e}")
+        print(f"ERROR: Failed during JSON to Pandas DataFrame conversion: {e}")
         sys.exit(1)
 
     # 3. Add Partitioning Column
     print("Adding partitioning column 'uniprot_id_prefix'...")
     try:
-        # Ensure uniprot_id is string type before slicing
         df['uniprot_id'] = df['uniprot_id'].astype(str)
-        df['uniprot_id_prefix'] = df['uniprot_id'].str[0].fillna('?') # Use '?' for empty/null IDs
+        df['uniprot_id_prefix'] = df['uniprot_id'].str[0].fillna('?')
+        # Convert partitioning column to category for potential efficiency with dictionary type
+        df['uniprot_id_prefix'] = df['uniprot_id_prefix'].astype('category')
     except Exception as e:
-         print(f"ERROR: Failed to create partitioning column: {e}")
-         sys.exit(1)
-
-    # 4. Convert DataFrame to PyArrow Table
-    print("Converting DataFrame to PyArrow Table...")
-    try:
-        # preserve_index=False because we already reset the index
-        # PyArrow might issue warnings about converting complex types (like lists of dicts)
-        # - these are often fine but monitor if issues arise during writing/reading
-        table = pa.Table.from_pandas(df, schema=DATA_SCHEMA,preserve_index=False)
-        print("PyArrow Table created successfully.")
-        # print("Schema:", table.schema) # Uncomment to inspect inferred schema
-    except Exception as e:
-        print(f"ERROR: Failed during DataFrame to PyArrow Table conversion: {e}")
+        print(f"ERROR: Failed to create partitioning column: {e}")
         sys.exit(1)
 
-    # 5. Configure R2 Filesystem Connection
+    # 4. Convert Pandas DataFrame to PyArrow Table
+    print("Converting Pandas DataFrame to PyArrow Table with specified schema...")
+    try:
+        table = pa.Table.from_pandas(df, schema=DATA_SCHEMA, preserve_index=False)
+        print("PyArrow Table created successfully")
+    except Exception as e:
+        print("Pyarrow conversion")
+    del df
+    gc.collect()
+
+
+    # 5. Configure PyArrow R2 Filesystem Connection
     print("Configuring R2 filesystem connection...")
     try:
+        # Using pandas dataframe
         r2_fs = pafs.S3FileSystem(
             endpoint_override=r2_endpoint,
             access_key=r2_access_key,
             secret_key=r2_secret_key,
             scheme="https" # R2 uses HTTPS
-            # region parameter usually not needed for R2 unless specified otherwise
         )
-        # Test connection by listing root or target dir (can be slow)
+        # Test connection by listing root or target dir
         print("Testing R2 connection (listing bucket root)...")
         print(r2_fs.get_file_info("/"))
     except Exception as e:
         print(f"ERROR: Failed to configure R2 filesystem connection: {e}")
         sys.exit(1)
 
-    # 6. Write Parquet Dataset to R2
-    full_dataset_uri = f"{r2_bucket_name}/{R2_OUTPUT_DIR}"
-    print(f"Writing partitioned Parquet dataset to: {full_dataset_uri}")
+
+    # 6. Write PyArrow Table to Partitioned Parquet Dataset on R2
+    full_dataset_path = f"{r2_bucket_name}/{R2_OUTPUT_DIR}"
+    print(f"Writing partitioned Parquet dataset using PyArrow to: s3://{full_dataset_path}")
     write_start_time = time.time()
     try:
+        if table is None:
+            print("Error: PyArrow table is None, cannot write")
+            sys.exit(1)
+        
         pq.write_to_dataset(
-            table,
-            root_path=full_dataset_uri,
-            partition_cols=['uniprot_id_prefix'],
+            table, 
+            root_path = full_dataset_path,
+            partition_cols = ['uniprot_id_prefix'],
+            schema=DATA_SCHEMA,
             filesystem=r2_fs,
-            use_threads=False, # Enable multi-threaded writing
-            existing_data_behavior='overwrite_or_ignore' # Overwrite if exists, good for reruns
+            use_threads=False,
+            existing_data_behavior='overwrite_or_ignore'
         )
         write_end_time = time.time()
-        print("Successfully wrote Parquet dataset to R2.")
-        print(f"R2 write time: {write_end_time - write_start_time:.2f} seconds")
-
+        print("Data written to Parquet dataset to R2 using PyArrow")
+        print(f"PyArrow write time: {write_end_time - write_start_time:.2f} seconds")
     except Exception as e:
-        print(f"ERROR: Failed during Parquet dataset writing to R2: {e}")
-        sys.exit(1)
+            print(f"ERROR: Failed during PyArrow Parquet dataset writing to R2: {e}")
+            sys.exit(1)
+    finally:
+        del table
+        gc.collect()
 
     # 7. Final Summary
     end_time = time.time()
     print("\n--- Upload Summary ---")
-    print(f"Input JSON records:      {len(integrated_data)}")
-    print(f"DataFrame dimensions:    {df.shape}")
-    print(f"Parquet dataset written: {full_dataset_uri}")
-    print(f"Total time taken:        {end_time - start_time:.2f} seconds")
+    print(f"Input JSON records:      {len(initial_data_len)}")
+    print(f"Parquet dataset written: s3://{full_dataset_path}")
+    print(f"Total time taken:      {end_time - start_time:.2f} seconds")
     print("------------------------")
 
 if __name__ == "__main__":
