@@ -1,0 +1,11 @@
+embed_dim: 64
+num_filters: 64
+kernel_sizes: [3, 5, 7]
+protein_encode_dim: 32
+dropout: 0.2
+batch_size: 32
+epochs: 10
+lr: 0.001
+n_clusters: 10
+train_frac: 0.8
+log_interval: 100
