@@ -1,23 +1,23 @@
 import os
+import argparse
 import json
 import sys
 import time 
+import gc
 
 import numpy as np
 import pandas as pd
 
-import dask.dataframe as dd
-import dask.array as da
-
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pyarrow.fs as pafs
-from dask.distributed import Client, LocalCluster
 
 from dotenv import load_dotenv
 
 # --- Configuration ---
 ENV_FILE_PATH = ".env"
 # R2 Path for the INPUT dataset (MUST match db_writer_cloud.py output)
-R2_DATASET_DIR = "integrated_data/viridiplantae_dataset_partitioned_from_json"
+DEFAULT_R2_DATASET_DIR = "integrated_data/viridiplantae_dataset_partitioned_from_json"
 STATS_OUTPUT_FILE = "mean_std.json" # Output file for dataset.py
 GELATION_DOMAINS = ["PF00190", "PF04702", "PF00234"]
 
@@ -48,17 +48,32 @@ if not all([r2_access_key, r2_secret_key, r2_bucket_name, r2_endpoint]):
     print("ERROR: Missing Cloudflare R2 credentials/config (KEY, SECRET, BUCKET, ENDPOINT/ACCOUNT_ID) in environment/.env or system environment.")
     sys.exit(1)
 
-# Prepare storage options for Dask
-storage_options = {'key': r2_access_key, 'secret': r2_secret_key, 'endpoint_url': r2_endpoint}
+
+# Configure PyArrow R2 Filesystem
+try:
+    r2_fs = pafs.S3FileSystem(
+        endpoint_override=r2_endpoint,
+        access_key=r2_access_key,
+        secret_key=r2_secret_key,
+        scheme="https" # R2 uses HTTPS
+    )
+
+    print(f"Testing R2 connection to bucket '{r2_bucket_name}'...")
+    r2_fs.get_file_info(f"{r2_bucket_name}/") # Check connectivity to the bucket itself
+    print("R2 Filesystem connection successful.")
+except Exception as e:
+    print(f"ERROR: Failed to configure or connect R2 filesystem for bucket '{r2_bucket_name}': {e}")
+    sys.exit(1)
+
 print(f"Using R2 Endpoint: {r2_endpoint}, Bucket: {r2_bucket_name}")
 
 
-# --- Helper Functions for Feature Extraction (to be used with Dask) ---
+# --- Helper Functions for Feature Extraction ---
 def extract_protein_features_numeric(row):
     """
-    Extracts numeric protein features from a row (Pandas Series).
-    Handles missing data by returning NaNs or default values.
-    Returns a NumPy array of fixed size (EXPECTED_NUM_PROTEIN_FEATURES).
+        Extracts numeric protein features from a row (Pandas Series).
+        Handles missing data by returning NaNs or default values.
+        Returns a NumPy array of fixed size (EXPECTED_NUM_PROTEIN_FEATURES).
     """
     try:
         phy_prop = row.get('physicochemical_properties', {}) or {}
@@ -70,10 +85,17 @@ def extract_protein_features_numeric(row):
         # Extract continuous features, defaulting to np.nan if missing or not finite
         def safe_float(value, default=np.nan):
             try:
-                f_val = float(value)
-                return f_val if np.isfinite(f_val) else default
+                # Check if value is already a float/int and finite
+                if isinstance(value, (int, float)) and np.isfinite(value):
+                    return float(value)
+                # Attempt conversion if not already suitable type
+                if value is not None:
+                    f_val = float(value)
+                    return f_val if np.isfinite(f_val) else default
+                return default # Return default if value is None
             except (TypeError, ValueError):
                 return default
+
 
         prot_cont = [
             safe_float(row.get('sequence_length', 0)), # Use get for top-level too
@@ -120,13 +142,13 @@ def extract_residue_features_numeric(row):
             return []
 
         # Use .get() with default empty list for safety
-        seq_res_feats = row.get('residue_features', []) or []
-        struct_list = row.get('structural_features', []) or []
+        seq_res_feats = row.get('residue_features', [])
+        struct_list = row.get('structural_features', [])
         struct = struct_list[0] if struct_list and isinstance(struct_list[0], dict) else {}
-        struct_res_details = struct.get('dssp_residue_details', []) or [] # Corrected key based on db_writer.py output
+        struct_res_details = struct.get('dssp_residue_details', [])
 
         for i in range(seq_len):
-            # Get features for residue i, handling potential index errors or type issues
+            # Get features for residue i
             res_f = seq_res_feats[i] if i < len(seq_res_feats) and isinstance(seq_res_feats[i], dict) else {}
             # Use dssp_residue_details from struct
             res_d = struct_res_details[i] if i < len(struct_res_details) and isinstance(struct_res_details[i], dict) else {}
@@ -134,8 +156,12 @@ def extract_residue_features_numeric(row):
             # Extract continuous features, handling None/NaN/TypeErrors, default to np.nan
             def safe_float(value, default=np.nan):
                 try:
-                    f_val = float(value)
-                    return f_val if np.isfinite(f_val) else default
+                    if isinstance(value, (int, float)) and np.isfinite(value):
+                       return float(value)
+                    if value is not None:
+                       f_val = float(value)
+                       return f_val if np.isfinite(f_val) else default
+                    return default
                 except (TypeError, ValueError):
                     return default
 
@@ -158,164 +184,183 @@ def extract_residue_features_numeric(row):
         return residue_data # Each element is a list of features for one residue
 
     except Exception as e:
-        return []
+        # import traceback  
+        # traceback.print_exc()
+        return [] 
 
 
 if __name__ == "__main__":
-    print("--- Starting Statistics Calculation using Dask ---")
+
+    parser = argparse.ArgumentParser(description="Calculate protein/residue feature statistics from a Parquet dataset on R2.")
+    parser.add_argument('--r2_input_path', type=str, default=DEFAULT_R2_DATASET_DIR,
+                        help=f'Path to the INPUT Parquet dataset directory within the R2 bucket. Default: {DEFAULT_R2_DATASET_DIR}')
+    parser.add_argument('--output_file', type=str, default=STATS_OUTPUT_FILE,
+                        help=f'Path to save the output JSON statistics file. Default: {STATS_OUTPUT_FILE}')
+    args = parser.parse_args()
+
+    print("--- Starting Statistics Calculation using Pandas/NumPy ---")
     start_time = time.time()
 
-    # Initialize Dask Client
-    # Using LocalCluster provides more control and resources than the default threaded scheduler
-    # Adjust n_workers and memory_limit based on your machine
-    cluster = LocalCluster(n_workers=os.cpu_count(), threads_per_worker=1, memory_limit='auto')
-    client = Client(cluster)
-    print(f"Dask dashboard link: {client.dashboard_link}")
 
-    full_dataset_uri = f"r2://{r2_bucket_name}/{R2_DATASET_DIR}"
+    full_dataset_path = f"{r2_bucket_name}/{args.r2_input_path}"
     stats = {} # Dictionary to store results
+    df = None # Dataframe vaiable
+    protein_feature_np_array = None
+    residue_features_np_array = None
+    protein_features_series = None
 
     try:
-        # Read Parquet into Dask DataFrame
-        print(f"\nReading Dask DataFrame from: {full_dataset_uri}")
-        ddf = dd.read_parquet(full_dataset_uri,
-                              columns=COLUMNS_TO_READ,
-                              storage_options=storage_options)
+        # Read Entire Parquet Dataset into Pandas DataFrame
+        print(f"\nReading Parquet dataset into Pandas DataFrame from: s3://{full_dataset_path}")
+        print("This may take significant time and memory depending on dataset size.")
+        load_start = time.time()
+
+        try:
+            # Use PyArrwo ParquetDataset to read data
+            dataset = pq.ParquetDataset(
+                full_dataset_path, 
+                filesystem=r2_fs
+            )
+            # Read columns into PyArrow Table, then convert to Pandas
+            table = dataset.read(columns=COLUMNS_TO_READ)
+            df = table.to_pandas()
+            del table, dataset
+            gc.collect()
+            load_end = time.time()
+            print(f"Pandas DataFrame loaded successfully with shape: {df.shape}")
+            print(f"Data loading took {load_end - load_start:.2f} seconds.")
+            if df.empty:
+                 print("ERROR: Loaded DataFrame is empty. Check the input path and data.")
+                 sys.exit(1)
+        except Exception as e:
+            print(f"\nERROR: Failed to load Parquet dataset into Pandas: {e}")
+            sys.exit(1)
         
-        print(f"Dask DataFrame created with {ddf.npartitions} partitions.")
 
-        # --- Calculate Protein Stats ---
-        print("\nCalculating protein-level statistics...")
+        # Calcualte Protein Stats
+        print("Calculating protein level stats")
         protein_start_time = time.time()
-        # Apply the extraction function row-wise -> Series of numpy arrays
-        # Need meta to specify the output type/shape for Dask
-        protein_features_series = ddf.apply(extract_protein_features_numeric, axis=1,
-                                            meta=('protein_features', 'object'))
 
-        # Convert the Series of arrays into a Dask Array for efficient stats
-        # WARNING: This step can consume significant memory on the Dask scheduler/workers
-        # if the number of proteins is very large.
-        print("  Stacking protein features into Dask Array (potentially memory intensive)...")
-        protein_features_dask_array = da.stack(protein_features_series.values)
-        print("  Dask Array for protein features created.")
+        # Apply Extraction function row wise -> Series of numpy arrays
+        protein_features_series = df.apply(extract_protein_features_numeric, axis=1)
 
-        # Compute mean and std using Dask Array functions (handles NaNs)
-        print("  Computing protein mean and std...")
-        protein_mean = da.nanmean(protein_features_dask_array, axis=0)
-        protein_std = da.nanstd(protein_features_dask_array, axis=0)
+        protein_features_list = protein_features_series.tolist()
+        protein_features_list = [arr for arr in protein_features_list if isinstance(arr, np.ndarray)]
+        
+        if not protein_features_list:
+            print("ERROR: No Valid Protein feature list extracted")
+            sys.exit()
 
-        # Trigger computation
-        protein_mean_computed, protein_std_computed = da.compute(protein_mean, protein_std)
-        protein_end_time = time.time()
-        print(f"Protein stats computed in {protein_end_time - protein_start_time:.2f} seconds.")
+        print("Stacking Protein feature list into numpy Array")
+        protein_feature_np_array = np.stack(protein_features_list)
+        print(f" Protein feature array shape: {protein_feature_np_array.shape}")
 
-        # --- Calculate Residue Stats ---
-        print("\nCalculating residue-level statistics (may take significant time/memory)...")
+        # Compute mean and std using numpy funtions
+        print("Computing mean and std")
+        with np.errstate(invalid='ignore'):
+            protein_mean_computed = np.nanmean(protein_feature_np_array.astype(np.float64), axis=0)
+            protein_std_computed = np.nanstd(protein_feature_np_array.astype(np.float64), axis=0)
+        
+        proteint_end_time = time.time()
+
+
+        # Compute residue stats
+        print("Calculating residue stats")
         residue_start_time = time.time()
 
-        # 1. Define function to apply to each partition to flatten residue features
-        # This avoids creating a Dask Series containing large lists, improving memory efficiency.
-        def partition_to_residue_features_df(df_partition):
-            all_res_features = []
-            for _, row in df_partition.iterrows():
-                 # Extract list of feature lists for the protein
-                 protein_residues = extract_residue_features_numeric(row)
-                 # Extend the main list only if the extraction was successful
-                 if protein_residues:
-                     # Convert inner lists to numpy arrays for consistency if needed
-                     # all_res_features.extend([np.array(res, dtype=np.float64) for res in protein_residues])
-                     all_res_features.extend(protein_residues) # Keep as list of lists if helpers return lists
+        all_residue_features_list = []
+        print("Extracting all residue features...")
+        extraction_errors = 0
+        processed_rows = 0
+        total_rows = len(df)
 
-            # Create a DataFrame from the flattened list for this partition
-            if not all_res_features:
-                # Return empty DataFrame with correct columns if no residues in partition
-                return pd.DataFrame(columns=[f'f_{i}' for i in range(EXPECTED_NUM_RESIDUE_FEATURES)], dtype=np.float64)
+        print("Applying residue extraction function (this can take time)...")
+        apply_start = time.time()
+        residue_results_series = df.apply(extract_residue_features_numeric, axis=1)
+        apply_end = time.time()
+        print(f"Residue extraction function applied in {apply_end - apply_start:.2f} seconds.")
 
-            # Specify column names for clarity
-            col_names = [f'f_{i}' for i in range(EXPECTED_NUM_RESIDUE_FEATURES)]
-            return pd.DataFrame(all_res_features, columns=col_names, dtype=np.float64)
+        # Now process the results
+        print("Processing extracted residue feature lists...")
+        for result_list in residue_results_series:
+            if result_list:
+                all_residue_features_list.extend(result_list)
+            else:
+                extraction_errors += 1
+            processed_rows += 1
+            if processed_rows % 5000 == 0: # Progress indicator
+                 print(f"    Processed {processed_rows}/{total_rows} proteins' residue results...", end='\r')
 
-        # 2. Apply the function using map_partitions
-        # Define the expected output metadata (schema) for Dask
-        meta_residue_df = pd.DataFrame(columns=[f'f_{i}' for i in range(EXPECTED_NUM_RESIDUE_FEATURES)], dtype=np.float64)
-        print("  Applying residue extraction via map_partitions...")
-        residue_df_exploded = ddf.map_partitions(partition_to_residue_features_df, meta=meta_residue_df)
-        print("  Residue data exploded (intermediate Dask DataFrame created).")
+        print(f"\nFinished processing residue results for {processed_rows} proteins.") # Newline
+        if extraction_errors > 0:
+            print(f"Note: Failed to extract any residue features for {extraction_errors} rows.")
 
-        # 3. Compute stats on the exploded DataFrame's Dask Array representation
-        # Ensure sufficient partitions or repartition if needed before array conversion for large data
-
-        # Convert to Dask Array
-        # WARNING: This step creates a potentially *very* large Dask Array containing
-        # features for *all* residues across the dataset. Monitor memory usage closely.
-        print("  Converting exploded residue DataFrame to Dask Array (potentially memory intensive)...")
-        # lengths=True is important when converting from DataFrames where partition lengths are unknown
-        residue_dask_array = residue_df_exploded.to_dask_array(lengths=True)
-        print("  Dask Array for residue features created.")
-
-        # Compute mean/std using Dask Array functions
-        print("  Computing residue mean and std...")
-        residue_mean = da.nanmean(residue_dask_array, axis=0)
-        residue_std = da.nanstd(residue_dask_array, axis=0)
-
-        # Trigger computation
-        residue_mean_computed, residue_std_computed = da.compute(residue_mean, residue_std)
+        if not all_residue_features_list:
+            print("ERROR: No valid residue features were collected from any protein.")
+            # Optional: Add more debug info here if needed, e.g., print residue_results_series.head()
+            sys.exit(1)
+        
+        print("Converting List of lists into numpy array")
+        print(f"Converting {len(all_residue_features_list)} residue features into numpy array")
+        try:
+            residue_features_np_array = np.array(all_residue_features_list, dtype=np.float64)
+            del all_residue_features_list
+            gc.collect()
+            print(f"Residue features array shape {residue_features_np_array.shape}")
+        except Exception as e:
+            print(f"Error: While converting list to np array {e}")
+        
+        # Compute mean and std using numpy functions
+        print("Compute residue mean and std")
+        with np.errstate(invalid='ignore'):
+            residue_mean_computed = np.nanmean(residue_features_np_array, axis=0)
+            residue_std_computed = np.nanstd(residue_features_np_array, axis=0)
+        
         residue_end_time = time.time()
         print(f"Residue stats computed in {residue_end_time - residue_start_time:.2f} seconds.")
 
-        # --- Prepare and Save Stats ---
-        # Add a small epsilon to std dev to prevent division by zero during normalization
+        
+        # Check
         epsilon = 1e-7
+        protein_mean_final = np.nan_to_num(protein_mean_computed, nan=0.0)
+        protein_std_final = np.nan_to_num(protein_std_computed, nan=0.0)
+        residue_mean_final = np.nan_to_num(residue_mean_computed, nan=0.0)
+        residue_std_final = np.nan_to_num(residue_std_computed, nan=0.0)
+
+        # Ensure std dev is not zero after nan_to_num
+        protein_std_final[protein_std_final < epsilon] = epsilon
+        residue_std_final[residue_std_final < epsilon] = epsilon
+
+
         stats = {
-            'protein_mean': protein_mean_computed.tolist(),
-            'protein_std': np.maximum(protein_std_computed, 0.0, dtype=np.float64) + epsilon,
-            'residue_mean': residue_mean_computed.tolist(),
-            'residue_std': np.maximum(residue_std_computed, 0.0, dtype=np.float64) + epsilon
+            # Convert to list for JSON serialization
+            'protein_mean': protein_mean_final.tolist(),
+            'protein_std': protein_std_final.tolist(),
+            'residue_mean': residue_mean_final.tolist(),
+            'residue_std': residue_std_final.tolist()
         }
-        # Convert std devs back to lists for JSON serialization
-        stats['protein_std'] = stats['protein_std'].tolist()
-        stats['residue_std'] = stats['residue_std'].tolist()
 
-
-        print(f"\nSaving statistics to: {STATS_OUTPUT_FILE}")
+        
+        # Saving
+        print(f"\n Saving statistics to: {args.output_file}")
         try:
-            # Ensure directory exists if STATS_OUTPUT_FILE includes a path
-            output_dir = os.path.dirname(STATS_OUTPUT_FILE)
-            if output_dir: # Only create if path is not just a filename
+            output_dir = os.path.dirname(args.output_file)
+            if output_dir:
                 os.makedirs(output_dir, exist_ok=True)
-
-            with open(STATS_OUTPUT_FILE, 'w') as f:
-                json.dump(stats, f, indent=4) # Use indent for readability
+            
+            with open(args.output_file, 'w') as f:
+                json.dump(stats, f, indent=4)
+            
             print("Statistics saved successfully.")
-            print("\n--- Statistics Summary ---")
-            print(f"Protein Mean Vector Length: {len(stats['protein_mean'])}")
-            print(f"Protein Std Dev Vector Length: {len(stats['protein_std'])}")
-            print(f"Residue Mean Vector Length: {len(stats['residue_mean'])}")
-            print(f"Residue Std Dev Vector Length: {len(stats['residue_std'])}")
-
-
-        except IOError as e:
-            print(f"ERROR: Could not write statistics file '{STATS_OUTPUT_FILE}': {e}")
         except Exception as e:
-            print(f"ERROR: An unexpected error occurred during file writing: {e}")
+            print(f"Error saving stats: {e}")
 
-
-    except ImportError as e:
-        print(f"ERROR: Missing Dask library components: {e}. Try 'pip install dask[dataframe] distributed'")
-        sys.exit(1)
     except Exception as e:
-        print(f"\nAn error occurred during Dask statistics calculation: {e}")
-        # import traceback; traceback.print_exc() # Uncomment for detailed traceback during debugging
-        sys.exit(1)
+        print(f"Error occurred while computing stats: {e}")
     finally:
-        # Shutdown Dask client and cluster
-        print("\nShutting down Dask client and cluster...")
-        if 'client' in locals():
-            client.close()
-        if 'cluster' in locals():
-            cluster.close()
-        print("Dask resources released.")
-
+        del df, protein_features_series, protein_feature_np_array, residue_features_np_array
+        gc.collect()
+    
     end_time = time.time()
-    print(f"\n--- Statistics Calculation Finished ---")
-    print(f"Total execution time: {end_time - start_time:.2f} seconds")
+    print("Statistics computation finished")
+    print(f"Execution time: {end_time-start_time:.2f} seconds")

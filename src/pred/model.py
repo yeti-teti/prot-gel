@@ -6,7 +6,7 @@ class ProtProp(nn.Module):
         super(ProtProp, self).__init__()
 
         # Sequence encoder
-        self.embedding = nn.Embedding(21, embed_dim) # 20 aa + 1 unk
+        self.embedding = nn.Embedding(22, embed_dim) # 20 aa + 1 unk + 1 padding (idx 0)
         residue_feature_dim = 14 # 6 continuous + 8 one-hot SS
         input_dim = embed_dim + residue_feature_dim
         self.convs = nn.ModuleList([

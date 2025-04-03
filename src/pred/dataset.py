@@ -2,6 +2,8 @@ import os
 import json
 import sys
 import bisect
+import gc
+from collections import OrderedDict
 
 import torch
 from torch.utils.data import Dataset
@@ -9,14 +11,21 @@ from torch.utils.data import Dataset
 import numpy as np
 import pandas as pd
 
-import dask.dataframe as dd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pyarrow.fs as pafs
 
 from dotenv import load_dotenv
 
+# Constants mirroring calculate_stats.py (Important for validation)
+GELATION_DOMAINS = ["PF00190", "PF04702", "PF00234"]
+# Expecting 10 continuous + num_gelation_domains binary flags
+EXPECTED_NUM_PROTEIN_FEATURES = 10 + len(GELATION_DOMAINS)
+# Expecting 6 continuous residue features (hydro, polar, vol, acc, phi, psi)
+EXPECTED_NUM_RESIDUE_FEATURES_CONTINUOUS = 6
 
 class ProteinDataset(Dataset):
-    def __init__(self, r2_dataset_path, mean_std_path="mean_std.json", r2_config_env_path=".env", r2_bucket_name=None):
+    def __init__(self, r2_dataset_path, mean_std_path="mean_std.json", r2_config_env_path=".env", r2_bucket_name=None, cache_limit=2):
         """
             Args:
                 r2_dataset_path (str): Path WITHIN the R2 bucket to the partitioned Parquet dataset directory
@@ -29,26 +38,30 @@ class ProteinDataset(Dataset):
         self.mean_std_path = mean_std_path
         self.r2_config_env_path = r2_config_env_path
         self.r2_bucket_name_arg = r2_bucket_name
+        self.cache_limit = cache_limit
 
+        # Columns required for processing in __getitem__
+        self.columns_to_read = [
+            'uniprot_id', 'sequence', 'sequence_length',
+            'physicochemical_properties', 'residue_features',
+            'structural_features', 'domains', 'gelation'
+        ]
+
+        self.r2_fs = None
         self._load_r2_credentials_and_connect()
+
         self.mean_std = self._load_mean_std()
 
-        print("Initializing Dask DataFrame for ProteinDataset...")
-        self.ddf = self._load_dask_dataframe()
-        print(f"Dask DataFrame created with {self.ddf.npartitions} partitions for path: {r2_dataset_path}")
+        print("Scanning Parquet dataset metadata...")
+        self.parquet_files = []
+        self.file_row_counts = []
+        self.cumulative_row_counts = []
+        self.data_length = 0
+        self._scan_parquet_dataset()
+        print(f"Dataset initialized. Found {len(self.parquet_files)} Parquet files.")
+        print(f"Total dataset length: {self.data_length}")
 
-        # Calculate partition lengths and cumulative lengths for indexing
-        print(f"Calculating partition divisions for {r2_dataset_path} ... ")
-        self.partition_lens = self.ddf.map_partitions(len).compute()
-        self.cumulative_lens = np.cumsum([0] + self.partition_lens)
-        self.data_length = self.cumulative_lens[-1] # Total length is the last cumulative value
-        print(f"Total dataset length for {r2_dataset_path}: {self.data_length}")
-        if self.data_length == 0:
-            print(f"Warning: Dataset at {r2_dataset_path} is empty")
-
-        # Cache for computed partitions
-        self._partition_cache = {}
-        self._cache_limit = 2
+        self._dataframe_cache = OrderedDict()
 
         # Feature constants
         self.ss_classes = ['H', 'G', 'I', 'E', 'B', 'T', 'S', '-']
@@ -56,7 +69,7 @@ class ProteinDataset(Dataset):
         self.aa_to_int = {aa: i + 1 for i, aa in enumerate(self.aa_list)}
         self.unknown_aa_index = len(self.aa_list) + 1 # 21
         self.padding_idx = 0
-        self.gelation_domains = ["PF00190", "PF04702", "PF00234"]
+        self.gelation_domains = GELATION_DOMAINS
 
     def _load_r2_credentials_and_connect(self):
         """Loads R2 credentials from .env and sets bucket name and storage options."""
@@ -76,9 +89,21 @@ class ProteinDataset(Dataset):
         if not all([access_key, secret_key, self.r2_bucket_name, endpoint]):
             print("ERROR: Missing Cloudflare R2 credentials/config in environment/.env"); sys.exit(1)
 
-        # Store storage options for Dask
-        self.storage_options = {'key': access_key, 'secret': secret_key, 'endpoint_url': endpoint}
-        print(f"Dataset configured for R2 Endpoint: {endpoint}, Bucket: {self.r2_bucket_name}")
+        try:
+            self.r2_fs = pafs.S3FileSystem(
+                endpoint_override = endpoint,
+                access_key = access_key,
+                secret_key = secret_key,
+                scheme = 'https'
+            )
+            # Test connection by getting bucket info
+            print(f"Testing R2 connection to bucket '{self.r2_bucket_name}'...")
+            self.r2_fs.get_file_info(f"{self.r2_bucket_name}/") # Check connectivity
+            print("R2 Filesystem connection successful.")
+            print(f"Dataset configured for R2 Endpoint: {endpoint}, Bucket: {self.r2_bucket_name}")
+        except Exception as e:
+            print(f"ERROR: Failed to configure or connect R2 filesystem for bucket '{self.r2_bucket_name}': {e}")
+            sys.exit(1)
 
     def _load_mean_std(self):
         """Loads normalization statistics from the specified JSON file."""
@@ -88,81 +113,121 @@ class ProteinDataset(Dataset):
                 stats = json.load(f)
             # Convert back to numpy arrays
             for key in ['protein_mean', 'protein_std', 'residue_mean', 'residue_std']:
-                stats[key] = np.array(stats[key])
+                stats[key] = np.array(stats[key], dtype=np.float32)
+            print("Normalization stats loaded.")
             return stats
         except FileNotFoundError: 
             print(f"ERROR: Stats file not found: {self.mean_std_path}. Run calculate_stats.py"); sys.exit(1)
         except Exception as e: 
             print(f"ERROR: Loading stats file: {e}"); sys.exit(1)
 
-    def _load_dask_dataframe(self):
-        """Loads the Dask DataFrame from the specified R2 Parquet path."""
-
-        # Full URI for Dask
-        full_uri = f"r2://{self.r2_bucket_name}/{self.r2_dataset_dir}"
-        print(f"Reading full Parquet dataset form: {full_uri}")
+    def _scan_parquet_dataset(self):
+        """Scans the R2 directory for Parquet files and reads metadata to get row counts"""
+        full_dataset_uri = f"{self.r2_bucket_name}/{self.r2_dataset_path}"
+        print(f"Scanning Parquet files in: s3:://{full_dataset_uri}")
         try:
-            # Specify columns needed for __getitem__ processing
-            columns = ['uniprot_id', 'sequence', 'sequence_length', 'residue_features',
-                       'structural_features', 'physicochemical_properties', 'domains', 'gelation']
-            # Dask infers schema and reads the partitioned Parquet dataset efficiently
-            ddf = dd.read_parquet(full_uri, columns=columns, storage_options=self.storage_options)
-            print(f"Successfully initialized Dask DataFrame from {full_uri}")
-            return ddf
+            selector = pa.fs.FileSelector(full_dataset_uri, recursive=True)
+            file_infos = self.r2_fs.get_file_info(selector)
+
+            found_files = []
+            for file_info in file_infos:
+                if file_info.is_file and file_info.path.endswith('.parquet'):
+                    found_files.append(file_info.path)
+            if not found_files:
+                print(f"Warning: No .parquet files found in s3://{full_dataset_uri}")
+                self.data_length = 0
+                self.cumulative_row_counts = np.array([0])
+                return
+
+            self.parquet_files = sorted(found_files)
+            print(f"Found {len(self.parquet_files)} Parquet files. Reading row counts...")
+            current_total_rows = 0
+            row_counts = []
+            cumulative_rows = [0]
+
+            for i, file_path in enumerate(self.parquet_files):
+                try:
+                    metadata = pq.read_metadata(file_path, filesystem=self.r2_fs)
+                    num_rows = metadata.num_rows
+                    row_counts.append(num_rows)
+                    current_total_rows += num_rows
+                    cumulative_rows.append(current_total_rows)
+                except Exception as e:
+                    print(f"\nError: Failed to read metadata for file: {file_path}. Error {e}")
+                    row_counts.append(0)
+                    cumulative_rows.append(current_total_rows)
+            print(f"\n Finished reading metadata. Total rows : {current_total_rows}")
+            self.file_row_counts = np.array(row_counts)
+            self.cumulative_row_counts = np.array(cumulative_rows)
+            self.data_length = current_total_rows
         except Exception as e:
-            print(f"ERROR: Reading Parquet Dask DataFrame from {full_uri}: {e}")
-            sys.exit(1)
+            print(f"Error failed to read data from parquet {e}")
+            self.data_length = 0
+            self.parquet_files = []
+            self.file_row_counts = np.array([])
+            self.cumulative_row_counts = np.array([0])
 
     def __len__(self):
         """Returns the total number of items in the dataset."""
         return self.data_length
     
-    def _get_partition(self, partition_index):
-        """Gets a specific partition DataFrame, using cache or computing it."""
-        if partition_index in self._partition_cache:
-            return self._partition_cache[partition_index]
+    def _get_dataframe_for_index(self, idx):
+        """
+            Finds the correct Parquet file for global index, loads it into a Pandas Dataframe (using cache), and returns the DF and local index within that DF.
+        """
+        if not 0 <= idx < self.data_length:
+            raise IndexError(f"Global index {idx} out of bounds. Data length {self.data_length}")
+        
+        file_index = bisect.bisect_right(self.cumulative_row_counts, idx) - 1
+
+        if not (0 <= file_index < len(self.parquet_files)):
+            raise RuntimeError(f"Could not determine valid file index for global index {idx}. Cumulative counts: {self.cumulative_row_counts}")
+        
+        # Calculate the index within the specific file's DataFrame
+        local_idx = idx - self.cumulative_row_counts[file_index]
+
+        # Cache Handling
+        if file_index in self._dataframe_cache:
+            self._dataframe_cache.move_to_end(file_index)
+            return self._dataframe_cache[file_index], local_idx
         else:
-            # Compute the required parition into a Pandas DataFrame
-            print(f"  Computing partition {partition_index}...")
+            file_path = self.parquet_files[file_index]
+            print(f"  Cache miss. Loading file index {file_index}: s3://{file_path}...")
             try:
-                partition_df = self.ddf.get_partition(partition_index).compute()
-                print(f"  Partition {partition_index} computed (size: {len(partition_df)}).")
+                table = pq.read_table(
+                    file_path,
+                    filesystem = self.r2_fs,
+                    columns = self.columns_to_read
+                )
+                partition_df = table.to_pandas()
+                del table
+                gc.collect()
+                print(f"  Loaded DataFrame for file index {file_index} (Shape: {partition_df.shape}).")
+
+                if len(self._dataframe_cache) >= self.cache_limit:
+                    oldest_key, _ = self._dataframe_cache.popitem(last=False)
+                    print(f"  Cache limit reached. Removed file index {oldest_key} from cache.")
+                self._dataframe_cache[file_index] = partition_df
+
+                return partition_df, local_idx
             except Exception as e:
-                print(f"ERROR: Failed to compute partition {partition_index}: {e}")
-                raise
-            
-            # Update cache (LRU Like removing oldest)
-            if len(self._partition_cache) >= self._cache_limit:
-                try:
-                    first_key = next(iter(self._partition_cache))
-                    del self._partition_cache[first_key]
-                except StopIteration:
-                    pass # Cache already empty
-            
-            self._partition_cache[partition_index] = partition_df
-            return partition_df
+                raise RuntimeError(f"Failed to load data for index {idx} from file {file_path}") from e
 
     def __getitem__(self, idx):
-        """Gets and processes features for a single protein at the given index."""
-        if not 0 <= idx < self.data_length:
-            raise IndexError(f"Index {idx} out of bounds for dataset length {self.data_length}")
-
-        # Finding which parition the index belongs to 
-        # bisect_right finds the insertion point, subtract 1 for the correct partition index
-        partition_index = bisect.bisect_right(self.cummulative_lens, idx) - 1
-        # Calcualte index within that partition
-        local_idx = idx - self.cumulative_lens[partition_index]
+        """Gets and processes features for a single protein at the given global index."""
+        if self.data_length == 0:
+             raise IndexError("Cannot get item from an empty dataset.")
 
         try:
-            # Get the partition (computed if not cached)
-            partition_df = self._get_partition(partition_index)
+            # Get the Pandas DataFrame and local index for the requested global index
+            partition_df, local_idx = self._get_dataframe_for_index(idx)
+
+            # Access the specific row using the local index
             if local_idx >= len(partition_df):
-                raise IndexError(f"Calculated local index {local_idx} is out of bounds for computed partition {partition_index} (size {len(partition_df)})")
-            protein_data = partition_df.iloc[local_idx]
+                raise IndexError(f"Calculated local index {local_idx} is out of bounds for DataFrame from file index {bisect.bisect_right(self.cumulative_row_counts, idx) - 1} (size {len(partition_df)})")
+            protein_data = partition_df.iloc[local_idx] # protein_data is now a Pandas Series
         except Exception as e:
-            print(f"ERROR: Failed to get item at global index {idx} (partition {partition_index}, local index {local_idx}): {e}")
-            raise RuntimeError(f"Failed to retrieve item at index {idx}") from e
-        
+            raise RuntimeError(f"Failed to retrieve or access item at global index {idx}") from e
 
         # --- Feature Processing (Pandas Series 'protein_data') ---
         try:
@@ -190,10 +255,10 @@ class ProteinDataset(Dataset):
 
             # Residue Features Processing
             res_features_list = []
-            seq_res_feats = protein_data.get('residue_features', []) or []
-            struct_list = protein_data.get('structural_features', []) or []
+            seq_res_feats = protein_data.get('residue_features', [])
+            struct_list = protein_data.get('structural_features', [])
             struct = struct_list[0] if struct_list and isinstance(struct_list[0], dict) else {}
-            struct_res_details = struct.get('residue_details', []) or []
+            struct_res_details = struct.get('dssp_residue_details', [])
 
             expected_res_len_stats = len(self.mean_std['residue_mean']) # Should be 6
             expected_prot_len_stats = len(self.mean_std['protein_mean']) # Should be 13
@@ -204,20 +269,29 @@ class ProteinDataset(Dataset):
                 res_f = seq_res_feats[i] if i < len(seq_res_feats) and isinstance(seq_res_feats[i], dict) else {}
                 res_d = struct_res_details[i] if i < len(struct_res_details) and isinstance(struct_res_details[i], dict) else {}
 
-                # Extract continuous features, handling None/NaNs, default to 0.0 if missing
-                # AAIndex features
-                hydrophobicity = float(res_f.get('hydrophobicity', 0.0)) if np.isfinite(res_f.get('hydrophobicity', 0.0)) else 0.0
-                polarity = float(res_f.get('polarity', 0.0)) if np.isfinite(res_f.get('polarity', 0.0)) else 0.0
-                volume = float(res_f.get('volume', 0.0)) if np.isfinite(res_f.get('volume', 0.0)) else 0.0
-                # DSSP features
-                acc_raw = res_d.get('relative_accessibility')
-                acc = float(acc_raw) if acc_raw is not None and isinstance(acc_raw, (int, float)) and np.isfinite(acc_raw) else 0.0
-                phi_raw = res_d.get('phi')
-                phi = float(phi_raw) if phi_raw is not None and isinstance(phi_raw, (int, float)) and np.isfinite(phi_raw) else 0.0
-                psi_raw = res_d.get('psi')
-                psi = float(psi_raw) if psi_raw is not None and isinstance(psi_raw, (int, float)) and np.isfinite(psi_raw) else 0.0
+                def safe_float(value, default=0.0): # Default to 0.0 for features if missing/invalid
+                    try:
+                        if isinstance(value, (int, float)) and np.isfinite(value):
+                            return float(value)
+                        if value is not None:
+                            f_val = float(value)
+                            return f_val if np.isfinite(f_val) else default
+                        return default
+                    except (TypeError, ValueError):
+                        return default
 
-                cont_features = np.array([hydrophobicity, polarity, volume, acc, phi, psi], dtype=np.float64)
+                # Extract continuous features, handling None/NaNs, default to 0.0 if missing
+                # Match the order expected by calculate_stats.py for residue_mean/std
+                cont_features = np.array([
+                    # AAIndex features
+                    safe_float(res_f.get('hydrophobicity')),
+                    safe_float(res_f.get('polarity')),
+                    safe_float(res_f.get('volume')),
+                    # DSSP features
+                    safe_float(res_d.get('relative_accessibility')),
+                    safe_float(res_d.get('phi')),
+                    safe_float(res_d.get('psi'))
+                ], dtype=np.float64)
 
                 # Validate shape before normalization
                 if cont_features.shape[0] != expected_res_len_stats:
@@ -239,7 +313,7 @@ class ProteinDataset(Dataset):
                 residue_features_tensor = torch.tensor(np.array(res_features_list, dtype=np.float32), dtype=torch.float)
             else:
                 # Handle case where sequence might exist but no features could be processed (should be rare if seq check passed)
-                residue_features_tensor = torch.empty((0, num_residue_feat_dim), dtype=torch.float)
+                residue_features_tensor = torch.empty((0, num_residue_feat_dim), dtype=torch.float32)
 
             # Check consistency between sequence length and residue features dimension
             if seq_len != residue_features_tensor.shape[0]:
@@ -249,7 +323,7 @@ class ProteinDataset(Dataset):
                     residue_features_tensor = residue_features_tensor[:seq_len, :]
                 else:
                     padding_needed = seq_len - residue_features_tensor.shape[0]
-                    padding_tensor = torch.zeros((padding_needed, num_residue_feat_dim), dtype=torch.float)
+                    padding_tensor = torch.zeros((padding_needed, num_residue_feat_dim), dtype=torch.float32)
                     residue_features_tensor = torch.cat((residue_features_tensor, padding_tensor), dim=0)
 
 
@@ -261,19 +335,17 @@ class ProteinDataset(Dataset):
 
             # Extract continuous protein features, handle missing with 0.0
             prot_cont = [
-                float(protein_data.get('sequence_length', 0.0)), # Already have seq_len, but use stored value for consistency
-                float(phy_prop.get('molecular_weight', 0.0)),
-                float(phy_prop.get('aromaticity', 0.0)),
-                float(phy_prop.get('instability_index', 0.0)),
-                float(phy_prop.get('isoelectric_point', 0.0)),
-                float(phy_prop.get('gravy', 0.0)),
-                float(phy_prop.get('charge_at_pH_7', 0.0)),
-                float(struct.get('helix_percentage', 0.0)),
-                float(struct.get('sheet_percentage', 0.0)),
-                float(struct.get('coil_percentage', 0.0))
+                safe_float(protein_data.get('sequence_length', 0.0)),
+                safe_float(phy_prop.get('molecular_weight')),
+                safe_float(phy_prop.get('aromaticity')),
+                safe_float(phy_prop.get('instability_index')),
+                safe_float(phy_prop.get('isoelectric_point')),
+                safe_float(phy_prop.get('gravy')),
+                safe_float(phy_prop.get('charge_at_pH_7')),
+                safe_float(struct.get('helix_percentage')),
+                safe_float(struct.get('sheet_percentage')),
+                safe_float(struct.get('coil_percentage'))
             ]
-            # Ensure all are finite, replace NaN/inf with 0.0
-            prot_cont = [x if np.isfinite(x) else 0.0 for x in prot_cont]
 
             # Domain flags (binary categorical)
             domain_flags = [1.0 if any(isinstance(d, dict) and d.get('accession') == gd for d in domains) else 0.0
@@ -287,11 +359,11 @@ class ProteinDataset(Dataset):
 
             # Normalize protein features
             norm_prot = (prot_combined - self.mean_std['protein_mean']) / self.mean_std['protein_std']
-            protein_features_tensor = torch.tensor(norm_prot, dtype=torch.float)
+            protein_features_tensor = torch.tensor(norm_prot, dtype=torch.float32)
 
             # Label Processing
             gelation_label = protein_data.get('gelation', 'no') # Default to 'no' if missing
-            gelation_tensor = torch.tensor(1.0 if gelation_label == 'yes' else 0.0, dtype=torch.float)
+            gelation_tensor = torch.tensor(1.0 if gelation_label == 'yes' else 0.0, dtype=torch.float32)
 
             return {
                 'sequence': seq_tensor,
@@ -302,8 +374,5 @@ class ProteinDataset(Dataset):
             }
 
         except Exception as e:
-            # Log error with more context
             print(f"ERROR: Feature processing failed for index {idx} (ID: {protein_data.get('uniprot_id', 'N/A')}): {e}")
-            # Re-raise to make errors obvious during development/debugging
-            # In production, returning None might be preferred if collate_fn handles it robustly
             raise RuntimeError(f"Failed feature processing for item at index {idx}") from e

@@ -15,7 +15,6 @@ from rich.console import Console
 from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn, TimeElapsedColumn, MofNCompleteColumn
 from rich.logging import RichHandler
 
-import dask.dataframe as dd
 import pyarrow.fs as pafs
 from dotenv import load_dotenv
 
@@ -27,7 +26,7 @@ from .dataloaders import collate_fn
 SS_CLASSES = ['H', 'G', 'I', 'E', 'B', 'T', 'S', '-']
 AA_LIST = 'ACDEFGHIKLMNPQRSTVWY'
 AA_TO_INT = {aa: i + 1 for i, aa in enumerate(AA_LIST)}
-UNKNOWN_AA_INDEX = 0
+UNKNOWN_AA_INDEX = len(AA_LIST) + 1
 PADDING_IDX = 0
 GELATION_DOMAINS = ["PF00190", "PF04702", "PF00234"]
 
@@ -47,7 +46,7 @@ class ModelRunner:
 
         Args:
             config: Configuration object... (same as before)
-            r2_main_dataset_path (str): R2 path (relative to bucket) to the COMPLETE Parquet dataset directory (used for predict_single).
+            r2_main_dataset_path (str): R2 path (relative to bucket) to the COMPLETE Parquet dataset directory.
             train_r2_path (str, optional): R2 path for training data...
             val_r2_path (str, optional): R2 path for validation data...
             test_r2_path (str, optional): R2 path for test data...
@@ -109,7 +108,6 @@ class ModelRunner:
 
         # --- R2 Filesystem (Needed for predict_single) ---
         self._r2_fs = None # Lazy initialize filesystem for single prediction
-        self._ddf_main = None # Lazy initialize main ddf for single prediction
     
     def _setup_logging(self, verbosity):
         """Sets up Rich logging."""
@@ -214,34 +212,7 @@ class ModelRunner:
                  raise
         return self._r2_fs
     
-    def _get_main_ddf(self):
-        """Initializes and returns the Dask DataFrame for the main dataset."""
-        if self._ddf_main is None:
-            if not self.r2_main_dataset_path:
-                    raise ValueError("r2_main_dataset_path is required for single prediction but not set.")
-            self.logger.info(f"Initializing Dask DataFrame for main dataset: [green]{self.r2_main_dataset_path}[/]")
-            try:
-                # Need R2 bucket name
-                load_dotenv(dotenv_path=self.r2_env_path)
-                r2_bucket_name = os.getenv("CLOUDFARE_BUCKET_NAME")
-                if not r2_bucket_name: 
-                    raise ValueError("R2 bucket name not found in .env")
-
-                storage_options = self._get_r2_fs().storage_options # Get storage options from initialized fs
-                full_uri = f"r2://{r2_bucket_name}/{self.r2_main_dataset_path}"
-                # Define columns needed for processing a single protein
-                columns_needed = [
-                        'uniprot_id', 'sequence', 'sequence_length',
-                        'residue_features', 'structural_features',
-                        'physicochemical_properties', 'domains', 'gelation' # Gelation might not be needed for prediction
-                ]
-                self._ddf_main = dd.read_parquet(full_uri, columns=columns_needed, storage_options=storage_options)
-                self.logger.info(f"Main Dask DataFrame initialized ({self._ddf_main.npartitions} partitions).")
-            except Exception as e:
-                self.logger.error(f"Failed to initialize main Dask DataFrame from {full_uri}: {e}", exc_info=True)
-                raise
-        return self._ddf_main
-
+    
     def _get_dataloader(self, r2_data_path, is_train):
         """Helper to create dataset and dataloader"""
         if not r2_data_path:
@@ -265,10 +236,13 @@ class ModelRunner:
                 return None
 
             loader = DataLoader(
-                dataset, batch_size=self.config.batch_size,
-                shuffle=is_train, collate_fn=collate_fn,
+                dataset, 
+                batch_size=self.config.batch_size,
+                shuffle=is_train, 
+                collate_fn=collate_fn,
                 num_workers=getattr(self.config, 'num_workers', 0),
-                pin_memory=True if self.device.type == 'cuda' else False
+                pin_memory=True if self.device.type == 'cuda' else False,
+                persistent_workers=True if getattr(self.config, 'num_workers', 0) > 0 else False
             )
             return loader
         except Exception as e:
@@ -467,7 +441,7 @@ class ModelRunner:
         if self.mean_std is None: 
             raise ValueError("mean_std required.")
 
-        self.logger.info(f"Starting evaluation on test data (R2 Path): [green]{self.test_path}[/]")
+        self.logger.info(f"Starting evaluation on test data (R2 Path): [green]{self.test_r2_path}[/]")
 
         # Get Dataloader
         test_loader = self._get_dataloader(self.test_r2_path, is_train=False)
@@ -608,7 +582,7 @@ class ModelRunner:
                     try:
                         sequence = batch['sequence'].to(self.device, non_blocking=True)
                         residue_features = batch['residue_features'].to(self.device, non_blocking=True)
-                        protein_features = batch['proterin_features'].to(self.device, non_blocking=True)
+                        protein_features = batch['protein_features'].to(self.device, non_blocking=True)
                         ids_batch = batch['uniprot_ids']
 
                         logits = self.model(sequence, residue_features, protein_features) # [batch, 1]
