@@ -21,10 +21,7 @@ INPUT_JSON_FILENAME = "integrated_data.json"
 # Cloudflare R2 Output Configuration
 ENV_FILE_PATH = ".env" # Assumes .env file in the script's directory
 # Target path WITHIN the R2 bucket
-R2_OUTPUT_DIR = "integrated_data/viridiplantae_dataset_partitioned_from_json" # Example path
-
-# Partitions for Dask Datframe
-N_PARTITIONS = max(1, os.cpu_count() // 2 if os.cpu_count() else 4)
+R2_OUTPUT_DIR = "integrated_data/viridiplantae_dataset_partitioned_from_json"
 
 DATA_SCHEMA = pa.schema([
     # Basic Info
@@ -308,7 +305,7 @@ def main():
     # 7. Final Summary
     end_time = time.time()
     print("\n--- Upload Summary ---")
-    print(f"Input JSON records:      {len(initial_data_len)}")
+    print(f"Input JSON records:      {initial_data_len}")
     print(f"Parquet dataset written: s3://{full_dataset_path}")
     print(f"Total time taken:      {end_time - start_time:.2f} seconds")
     print("------------------------")

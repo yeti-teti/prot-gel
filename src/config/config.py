@@ -15,6 +15,7 @@ class Config:
     epochs: int = 10
     lr: float = 0.001
     log_interval: int = 100
+    num_workers: int = 10
     
     # Clustering
     n_clusters: int = 10

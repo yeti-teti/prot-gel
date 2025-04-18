@@ -396,7 +396,7 @@ def integrate_data(uniprot_data, pfam_data, structure_data_map):
         if not protein_info["structural_features"]:
             no_structure_count +=1
 
-        # Gelation prediction logic (remains the same)
+        # Gelation prediction logic 
         domains = protein_info["domains"]
         structs = protein_info["structural_features"]
         props = protein_info.get("physicochemical_properties", {})

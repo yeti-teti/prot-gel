@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 ENV_FILE_PATH = ".env"
 # R2 Path for the INPUT dataset (MUST match db_writer_cloud.py output)
 DEFAULT_R2_DATASET_DIR = "integrated_data/viridiplantae_dataset_partitioned_from_json"
-STATS_OUTPUT_FILE = "mean_std.json" # Output file for dataset.py
+STATS_OUTPUT_FILE = "../../data/mean_std.json" # Output file for dataset.py
 GELATION_DOMAINS = ["PF00190", "PF04702", "PF00234"]
 
 # Columns needed from Parquet (ensure these match what's needed by helpers)

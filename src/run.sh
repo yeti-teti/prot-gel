@@ -3,8 +3,6 @@
 # --- Configuration --- #
 # Adjust these paths according to your project structure and R2 bucket layout
 
-# Python executable/environment activation
-# Example: source /path/to/your/venv/bin/activate
 PYTHON_EXEC="python" # Or path to specific python executable
 
 # Main Python script
@@ -31,7 +29,7 @@ PRED_OUTPUT_DIR="$BASE_OUTPUT_DIR/predictions"
 
 # Checkpoint Paths
 RESUME_CHECKPOINT="$BASE_OUTPUT_DIR/training_run_YYYYMMDD_HHMMSS/epoch=X-step=Y.ckpt" # Path to resume from
-EVAL_MODEL_CHECKPOINT="$BASE_OUTPUT_DIR/training_run_YYYYMMDD_HHMMSS/epoch=X-step=Y.ckpt" # Path to evaluate
+EVAL_MODEL_CHECKPOINT="$BASE_OUTPUT_DIR/training_run_20250402_202118/epoch=1-step=543.ckpt" # Path to evaluate
 PREDICT_MODEL_CHECKPOINT="$BASE_OUTPUT_DIR/training_run_YYYYMMDD_HHMMSS/epoch=X-step=Y.ckpt" # Path to predict with
 
 

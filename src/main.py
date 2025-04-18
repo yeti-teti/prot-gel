@@ -89,10 +89,7 @@ def main():
             runner = ModelRunner(**runner_args)
             runner.evaluate(output_file=args.results_file)
         elif args.mode == 'predict':
-             # predict_r2_path is passed directly to the method, not __init__
-             runner_args.update({
-                 # No extra paths needed for runner init in predict mode itself
-             })
+             # predict_r2_path is passed directly to the method, not __init__ 
              runner = ModelRunner(**runner_args)
              runner.predict(predict_r2_path=args.predict_r2_path, out_file=args.results_file) # Pass paths here
         else:
