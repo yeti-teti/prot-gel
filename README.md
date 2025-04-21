@@ -305,7 +305,7 @@ Prediction options:
 - `-predict_r2_path`: R2 path to dataset for prediction
 - `-results_file`: Output file for predictions (TSV format)
 
-## Comparison to Patent US 2024/0016179 A1
+## Comparison to Patent
 
 This implementation focuses specifically on the computational aspects of the patent's broader discovery system. The patent describes a comprehensive "flywheel" approach (as shown in Figure 1) that combines in silico prediction with empirical testing in an iterative learning cycle.
 
