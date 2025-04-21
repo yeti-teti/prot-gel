@@ -60,7 +60,7 @@ def collate_fn(batch):
             'sequence': padded_sequences,
             'residue_features': padded_residue_features,
             'protein_features': protein_features,
-            'gelation': gelations.unsqueeze(1),  # Add channel dim for loss fn [batch, 1]
+            'gelation': gelations.unsqueeze(1),  # Adding channel dim for loss fn [batch, 1]
             'uniprot_ids': uniprot_ids
         }
     except Exception as e:

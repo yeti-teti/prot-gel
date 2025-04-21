@@ -32,7 +32,7 @@ GELATION_DOMAINS = ["PF00190", "PF04702", "PF00234"]
 
 class ModelRunner:
     def __init__(self, config,
-                 r2_main_dataset_path=None, # Path to the COMPLETE dataset on R2
+                 r2_main_dataset_path=None, 
                  train_r2_path=None,
                  val_r2_path=None,
                  test_r2_path=None,
@@ -45,7 +45,7 @@ class ModelRunner:
         Initializes the ModelRunner for R2/Parquet data, supporting batch and single prediction.
 
         Args:
-            config: Configuration object... (same as before)
+            config: Configuration object...
             r2_main_dataset_path (str): R2 path (relative to bucket) to the COMPLETE Parquet dataset directory.
             train_r2_path (str, optional): R2 path for training data...
             val_r2_path (str, optional): R2 path for validation data...
@@ -57,7 +57,6 @@ class ModelRunner:
             verbosity (str, optional): Logging level...
         """
         self.config = config
-        # Store all paths
         self.r2_main_dataset_path = r2_main_dataset_path
         self.train_r2_path = train_r2_path
         self.val_r2_path = val_r2_path
@@ -72,41 +71,39 @@ class ModelRunner:
         self._setup_logging(verbosity) # Logging setup helper
         self.logger.info(f"Using device: [bold blue]{self.device}[/]")
 
-        # --- Load mean_std statistics (Required for all operations) ---
+        #  Load mean_std statistics (Required for all operations) 
         self.mean_std = self._load_mean_std_from_file()
 
-        # --- Initialize model structure ---
+        #  Initialize model structure 
         self.logger.info("Initializing model architecture...")
         self.model = ProtProp(
-            embed_dim=getattr(config, 'embed_dim', 64), # Use getattr for safety
-            num_filters=getattr(config, 'num_filters', 64),
-            kernel_sizes=getattr(config, 'kernel_sizes', [3,5,7]),
-            protein_encode_dim=getattr(config, 'protein_encode_dim', 32),
-            dropout=getattr(config, 'dropout', 0.4)
+            embed_dim=config.embed_dim,
+            num_layers=config.num_layers,
+            num_heads=config.num_heads,
+            max_len=config.max_len,
+            protein_encode_dim=config.protein_encode_dim,
+            dropout=config.dropout
         ).to(self.device)
         self.logger.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,}")
 
-        # --- Define Optimizer (Needed for training and potentially loading state) ---
         self.optimizer = optim.Adam(self.model.parameters(), lr=getattr(config, 'lr', 1e-4))
         self.logger.info(f"Optimizer: Adam, LR: {getattr(config, 'lr', 1e-4)}")
 
-        # --- Intialize training state variables ---
         self.start_epoch = 0
         self.global_step = 0
 
-        # --- Load Checkpoint (if specified) ---
         if self.model_path:
-            self._load_checkpoint() # Checkpoint loading helper
+            self._load_checkpoint()
         else:
             self.logger.info("No model checkpoint specified. Model initialized with random weights.")
 
-        # --- Loss function (Needed for training/evaluation) ---
+        #  Loss function
         self.criterion = nn.BCEWithLogitsLoss()
 
-        # --- Setup Output Directory ---
+        #  Setup Output Directory 
         self._setup_output_dir() # Output dir helper
 
-        # --- R2 Filesystem (Needed for predict_single) ---
+        #  R2 Filesystem (Needed for predict_single) 
         self._r2_fs = None # Lazy initialize filesystem for single prediction
     
     def _setup_logging(self, verbosity):
@@ -127,7 +124,8 @@ class ModelRunner:
             self.logger.error(f"mean_std.json file not found or path not provided: {self.mean_std_json_path}")
             raise FileNotFoundError(f"mean_std.json is required.")
         try:
-            with open(self.mean_std_json_path, 'r') as f: stats_data = json.load(f)
+            with open(self.mean_std_json_path, 'r') as f: 
+                stats_data = json.load(f)
             mean_std_dict = {k: np.array(v, dtype=np.float64) for k, v in stats_data.items() if k in ['protein_mean', 'protein_std', 'residue_mean', 'residue_std']}
             if len(mean_std_dict) != 4: raise KeyError("Missing required keys in mean_std file.")
             return mean_std_dict
@@ -145,7 +143,7 @@ class ModelRunner:
         try:
             checkpoint = torch.load(self.model_path, map_location=self.device)
             self.model.load_state_dict(checkpoint['model_state_dict'])
-            # Load optimizer state only if it exists in the checkpoint
+            
             if 'optimizer_state_dict' in checkpoint:
                  self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                  self.logger.info("Loaded optimizer state from checkpoint.")
@@ -157,8 +155,7 @@ class ModelRunner:
             self.logger.info(f"Model loaded. Resuming from Epoch {self.start_epoch + 1}, Step {self.global_step}")
 
         except Exception as e:
-            self.logger.error(f"Error loading checkpoint: {e}. Model weights might be random.", exc_info=True)
-            # Reset state variables if loading fails, keep random weights in model
+            self.logger.error(f"Error loading checkpoint: {e}. Model weights is random.", exc_info=True)
             self.start_epoch = 0
             self.global_step = 0
             self.optimizer = optim.Adam(self.model.parameters(), lr=getattr(self.config, 'lr', 1e-4))
@@ -177,7 +174,8 @@ class ModelRunner:
 
     def _save_checkpoint(self, epoch, step):
         """Saves the current model, optimizer, state and mean_std"""
-        if not self.output_dir: return
+        if not self.output_dir: 
+            return
         checkpoint_name = f"epoch={epoch}-step={step}.ckpt"
         checkpoint_path = os.path.join(self.output_dir, checkpoint_name)
         try:
@@ -203,8 +201,13 @@ class ModelRunner:
                  secret_key = os.getenv("CLOUDFARE_SECRET_KEY")
                  account_id = os.getenv("CLOUDFARE_ACCOUNT_ID")
                  endpoint = os.getenv("CLOUDFARE_ENDPOINT")
-                 if not endpoint and account_id: endpoint = f"https://{account_id}.r2.cloudflarestorage.com"
-                 if not all([access_key, secret_key, endpoint]): raise ValueError("Missing R2 credentials")
+
+                 if not endpoint and account_id:
+                    endpoint = f"https://{account_id}.r2.cloudflarestorage.com"
+
+                 if not all([access_key, secret_key, endpoint]):
+                    raise ValueError("Missing R2 credentials")
+                 
                  self._r2_fs = pafs.S3FileSystem(endpoint_override=endpoint, access_key=access_key, secret_key=secret_key, scheme="https")
                  self.logger.debug("R2 filesystem initialized.")
             except Exception as e:
@@ -223,13 +226,14 @@ class ModelRunner:
             # Need bucket name from env for dataset init
             load_dotenv(dotenv_path=self.r2_env_path)
             r2_bucket_name = os.getenv("CLOUDFARE_BUCKET_NAME")
-            if not r2_bucket_name: raise ValueError("R2 bucket name not found in .env")
+            if not r2_bucket_name: 
+                raise ValueError("R2 bucket name not found in .env")
 
             dataset = ProteinDataset(
                 r2_dataset_path=r2_data_path,
                 mean_std_path=self.mean_std_json_path,
                 r2_config_env_path=self.r2_env_path,
-                r2_bucket_name=r2_bucket_name # Pass bucket name
+                r2_bucket_name=r2_bucket_name
             )
             if len(dataset) == 0:
                 self.logger.warning(f"Loaded dataset from {r2_data_path} but it has length 0.")
@@ -298,16 +302,16 @@ class ModelRunner:
 
             for epoch in range(self.start_epoch, self.config.epochs):
                 epoch_desc = f"[cyan]Epoch {epoch+1}/{self.config.epochs}"
-                progress.update(epoch_task, description=epoch_desc, loss=float('nan'), acc=float('nan')) # Reset epoch stats display
+                progress.update(epoch_task, description=epoch_desc, loss=float('nan'), acc=float('nan'))
 
-                # --- Training phase ---
+                #  Training phase 
                 self.model.train()
                 train_loss_accum = 0.0
                 train_batches = len(train_loader)
-                train_batch_task = progress.add_task(f"[green]  Train", total=train_batches, loss=float('nan'), acc=float('nan')) # No acc needed here
+                train_batch_task = progress.add_task(f"[green]  Train", total=train_batches, loss=float('nan'), acc=float('nan'))
 
                 for batch_idx, batch in enumerate(train_loader):
-                    if batch is None: # Skip batches that failed collation
+                    if batch is None:
                         self.logger.warning(f"Skipping None batch at epoch {epoch+1}, train batch index {batch_idx}")
                         progress.update(train_batch_task, advance=1)
                         continue
@@ -319,12 +323,14 @@ class ModelRunner:
                         gelation = batch['gelation'].to(self.device, non_blocking=True) # [batch, 1]
 
                         self.optimizer.zero_grad()
-                        logits = self.model(sequence, residue_features, protein_features) # [batch, 1]
+                        padding_mask = (sequence == PADDING_IDX)
+                        logits = self.model(sequence, residue_features, protein_features, padding_mask) # [batch, 1]
                         loss = self.criterion(logits, gelation) # BCEWithLogits expects [batch, 1] for both
 
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                        self.optimizer.step() # Corrected typo
+                        torch.nn.utils.clip_grad_value_(self.model.parameters(), 1.0)
+                        self.optimizer.step()
 
                         current_loss = loss.item()
                         train_loss_accum += current_loss
@@ -343,7 +349,7 @@ class ModelRunner:
 
                 progress.remove_task(train_batch_task) # Clean up task for the epoch
 
-                # --- Validation phase ---
+                #  Validation phase 
                 self.model.eval()
                 val_loss_accum = 0.0
                 correct = 0
@@ -366,7 +372,8 @@ class ModelRunner:
                             protein_features = batch['protein_features'].to(self.device, non_blocking=True)
                             gelation = batch['gelation'].to(self.device, non_blocking=True) # [batch, 1]
 
-                            logits = self.model(sequence, residue_features, protein_features) # [batch, 1]
+                            padding_mask = (sequence==PADDING_IDX)
+                            logits = self.model(sequence, residue_features, protein_features, padding_mask) # [batch, 1]
                             loss = self.criterion(logits, gelation)
                             val_loss_accum += loss.item()
 
@@ -484,8 +491,9 @@ class ModelRunner:
                         protein_features = batch['protein_features'].to(self.device, non_blocking=True)
                         gelation = batch['gelation'].to(self.device, non_blocking=True) # Ground truth labels [batch, 1]
                         ids_batch = batch['uniprot_ids'] # List of IDs
-
-                        logits = self.model(sequence, residue_features, protein_features) # [batch, 1]
+                        
+                        padding_mask = (sequence == PADDING_IDX)
+                        logits = self.model(sequence, residue_features, protein_features, padding_mask) # [batch, 1]
                         loss = self.criterion(logits, gelation)
                         test_loss_accum += loss.item()
 
@@ -585,7 +593,8 @@ class ModelRunner:
                         protein_features = batch['protein_features'].to(self.device, non_blocking=True)
                         ids_batch = batch['uniprot_ids']
 
-                        logits = self.model(sequence, residue_features, protein_features) # [batch, 1]
+                        padding_mask = (sequence == PADDING_IDX)
+                        logits = self.model(sequence, residue_features, protein_features, padding_mask) # [batch, 1]
                         probs = torch.sigmoid(logits) # [batch, 1]
 
                         all_predictions_probs.extend(probs.cpu().numpy().flatten())

@@ -17,7 +17,7 @@ import pyarrow.fs as pafs
 
 from dotenv import load_dotenv
 
-# Constants mirroring calculate_stats.py (Important for validation)
+# Constants mirroring calculate_stats.py 
 GELATION_DOMAINS = ["PF00190", "PF04702", "PF00234"]
 # Expecting 10 continuous + num_gelation_domains binary flags
 EXPECTED_NUM_PROTEIN_FEATURES = 10 + len(GELATION_DOMAINS)
@@ -115,9 +115,7 @@ class ProteinDataset(Dataset):
             for key in ['protein_mean', 'protein_std', 'residue_mean', 'residue_std']:
                 stats[key] = np.array(stats[key], dtype=np.float32)
             print("Normalization stats loaded.")
-            return stats
-        except FileNotFoundError: 
-            print(f"ERROR: Stats file not found: {self.mean_std_path}. Run calculate_stats.py"); sys.exit(1)
+            return stats 
         except Exception as e: 
             print(f"ERROR: Loading stats file: {e}"); sys.exit(1)
 
@@ -229,7 +227,7 @@ class ProteinDataset(Dataset):
         except Exception as e:
             raise RuntimeError(f"Failed to retrieve or access item at global index {idx}") from e
 
-        # --- Feature Processing (Pandas Series 'protein_data') ---
+        #  Feature Processing (Pandas Series 'protein_data') 
         try:
             uniprot_id = protein_data.get('uniprot_id', f"Missing ID: {idx}")
 

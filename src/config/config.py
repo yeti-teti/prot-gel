@@ -5,9 +5,10 @@ from dataclasses import dataclass
 class Config:
     # Model hyperparameters
     embed_dim: int = 64
-    num_filters: int = 64
-    kernel_sizes: list = None  # Will be set to [3, 5, 7] by default
+    num_layers: int = 3
+    num_heads: int = 3
     protein_encode_dim: int = 32
+    max_len: int = 2000
     dropout: float = 0.2
     
     # Training hyperparameters
@@ -20,10 +21,6 @@ class Config:
     # Clustering
     n_clusters: int = 10
     train_frac: float = 0.8
-
-    def __post_init__(self):
-        if self.kernel_sizes is None:
-            self.kernel_sizes = [3, 5, 7]
     
 def load_config(config_path):
     """Load configuraion from YAML file"""
