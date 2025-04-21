@@ -35,7 +35,7 @@ OUTPUT_PATH = os.path.join(BASE_DATA_DIR, INTEGRATED_JSON_FILE)
 
 # External tool paths
 DSSP_EXECUTABLE = "/opt/homebrew/bin/mkdssp" # Use the specific path provided
-HMMSCAN_EXECUTABLE = "hmmscan" # Keep for Pfam scan
+HMMSCAN_EXECUTABLE = "hmmscan" # Pfam scan
 
 # Parallelism
 MAX_WORKERS = os.cpu_count() 
@@ -162,7 +162,6 @@ def run_hmmscan_and_parse(fasta_path, hmm_db_path, output_table_path):
         print(f"Running hmmscan (output to {output_table_path})...")
         cmd = [HMMSCAN_EXECUTABLE, "--domtblout", output_table_path, hmm_db_path, fasta_path]
         try:
-            # Increased timeout, capture stderr
             result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=7200) # 2 hours timeout
             print("hmmscan completed successfully.")
         except FileNotFoundError:
@@ -289,8 +288,7 @@ def process_pdb_file(pdb_filepath, dssp_exec):
         parser = PDBParser(QUIET=True)
         structure = parser.get_structure(pdb_id_from_filename, pdb_filepath)
         if not structure or len(structure) == 0:
-             structural_feature["processing_error"] = "Biopython parse error or empty structure"
-             # Still return based on uniprot_ids found, but mark error
+             structural_feature["processing_error"] = "Biopython parse error or empty structure" 
              return [(uid, structural_feature) for uid in uniprot_ids_in_file]
         model = structure[0]
 
@@ -301,14 +299,12 @@ def process_pdb_file(pdb_filepath, dssp_exec):
             dssp_data = list(dssp)
         except FileNotFoundError:
              structural_feature["processing_error"] = f"DSSP executable not found at: {dssp_exec}"
-             # Return with error marked
              return [(uid, structural_feature) for uid in uniprot_ids_in_file]
         except Exception as dssp_err:
             error_detail = str(dssp_err)
             if isinstance(dssp_err, subprocess.CalledProcessError) and dssp_err.stderr:
                  error_detail += f" | DSSP stderr: {dssp_err.stderr.decode(errors='ignore')[:200]}"
             structural_feature["processing_error"] = f"DSSP execution failed: {error_detail}"
-            # Don't stop processing geometry if DSSP failed, but record error
 
         # Process DSSP Results
         residue_details = []
@@ -334,9 +330,8 @@ def process_pdb_file(pdb_filepath, dssp_exec):
             structural_feature["coil_percentage"] = ((total_residues - helix_count - sheet_count) / total_residues * 100) if total_residues else 0
             structural_feature["total_residues_dssp"] = total_residues
             structural_feature["dssp_residue_details"] = residue_details
-        elif not structural_feature["processing_error"]: # If DSSP produced no data but no error was logged yet
+        elif not structural_feature["processing_error"]:
              structural_feature["processing_error"] = "DSSP returned no data"
-
 
         # Calculate CA Coordinates and Contact Map
         ca_coordinates = []
@@ -369,10 +364,8 @@ def process_pdb_file(pdb_filepath, dssp_exec):
         return results_for_integration
 
     except Exception as general_err:
-        # Catch unexpected errors during parsing/processing after DBREF check
         err_msg = f"Unexpected error in process_pdb_file: {general_err}"
         structural_feature["processing_error"] = err_msg
-        # Return the feature dict marked with error, linked to the UniProt IDs
         return [(uid, structural_feature) for uid in uniprot_ids_in_file]
 
 
