@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# --- Configuration --- #
+#  Configuration  #
 # Adjust these paths according to your project structure and R2 bucket layout
 
 PYTHON_EXEC="python" # Or path to specific python executable
@@ -33,7 +33,7 @@ EVAL_MODEL_CHECKPOINT="$BASE_OUTPUT_DIR/training_run_20250402_202118/epoch=1-ste
 PREDICT_MODEL_CHECKPOINT="$BASE_OUTPUT_DIR/training_run_YYYYMMDD_HHMMSS/epoch=X-step=Y.ckpt" # Path to predict with
 
 
-# --- Helper Function --- #
+#  Helper Function  #
 usage() {
   echo "Usage: $0 {train|resume|evaluate|predict}"
   echo ""
@@ -47,19 +47,19 @@ usage() {
   exit 1
 }
 
-# --- Mode Execution --- #
+#  Mode Execution  #
 
 MODE=$1
 
 # Create base output directory if it doesn't exist
 mkdir -p "$BASE_OUTPUT_DIR"
 
-echo "-----------------------------------------"
+echo "--"
 echo "Mode: $MODE"
 echo "Config: $CONFIG_FILE"
 echo "Stats File: $STATS_FILE"
 echo "R2 Env File: $R2_ENV_FILE"
-echo "-----------------------------------------"
+echo "--"
 
 if [[ "$MODE" == "train" ]]; then
   echo "Starting NEW training run..."
@@ -143,7 +143,7 @@ else
   usage
 fi
 
-echo "-----------------------------------------"
+echo "--"
 echo "Script finished for mode: $MODE"
-echo "-----------------------------------------"
+echo "--"
 exit 0

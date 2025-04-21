@@ -14,14 +14,15 @@ import pyarrow.fs as pafs
 
 from dotenv import load_dotenv
 
-# --- Configuration ---
+# Configuration
 ENV_FILE_PATH = ".env"
-# R2 Path for the INPUT dataset (MUST match db_writer_cloud.py output)
+
+# R2 Path for the INPUT dataset 
 DEFAULT_R2_DATASET_DIR = "integrated_data/viridiplantae_dataset_partitioned_from_json"
 STATS_OUTPUT_FILE = "../../data/mean_std.json" # Output file for dataset.py
 GELATION_DOMAINS = ["PF00190", "PF04702", "PF00234"]
 
-# Columns needed from Parquet (ensure these match what's needed by helpers)
+# Columns needed from Parquet
 COLUMNS_TO_READ = ['uniprot_id', 'sequence_length', 'physicochemical_properties',
                    'structural_features', 'residue_features', 'domains']
 
@@ -31,7 +32,7 @@ EXPECTED_NUM_PROTEIN_FEATURES = 10 + len(GELATION_DOMAINS)
 # Residue: 6 continuous (hydrophobicity, polarity, volume, acc, phi, psi)
 EXPECTED_NUM_RESIDUE_FEATURES = 6
 
-# --- Load Environment Variables & Configure R2 FS ---
+# Load Environment Variables & Configure R2 FS
 print(f"Loading R2 credentials from: {ENV_FILE_PATH}")
 if not load_dotenv(dotenv_path=ENV_FILE_PATH):
     print(f"Warning: .env file not found at {ENV_FILE_PATH}. Using system environment variables.")
@@ -68,7 +69,7 @@ except Exception as e:
 print(f"Using R2 Endpoint: {r2_endpoint}, Bucket: {r2_bucket_name}")
 
 
-# --- Helper Functions for Feature Extraction ---
+# Helper Functions for Feature Extraction
 def extract_protein_features_numeric(row):
     """
         Extracts numeric protein features from a row (Pandas Series).
@@ -198,7 +199,7 @@ if __name__ == "__main__":
                         help=f'Path to save the output JSON statistics file. Default: {STATS_OUTPUT_FILE}')
     args = parser.parse_args()
 
-    print("--- Starting Statistics Calculation using Pandas/NumPy ---")
+    print("--- Starting Statistics Calculation using Pandas/NumPy")
     start_time = time.time()
 
 
@@ -297,7 +298,6 @@ if __name__ == "__main__":
 
         if not all_residue_features_list:
             print("ERROR: No valid residue features were collected from any protein.")
-            # Optional: Add more debug info here if needed, e.g., print residue_results_series.head()
             sys.exit(1)
         
         print("Converting List of lists into numpy array")

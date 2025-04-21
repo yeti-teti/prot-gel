@@ -21,9 +21,9 @@ from sklearn.cluster import AgglomerativeClustering, DBSCAN
 from sklearn.model_selection import train_test_split
 
 
-# --- Configuration & R2 Setup ---
+#  Configuration & R2 Setup 
 ENV_FILE_PATH = ".env"
-# R2 Path for the INPUT dataset (MUST match db_writer.py output)
+# R2 Path for the INPUT dataset 
 DEFAULT_R2_INPUT_DIR = "integrated_data/viridiplantae_dataset_partitioned_from_json"
 # Default R2 Paths for the OUTPUT train/test Parquet datasets
 DEFAULT_R2_TRAIN_DIR = "integrated_data/train_split_parquet"
@@ -338,7 +338,7 @@ def generate_embeddings(model, tokenizer, sequence_data, batch_size=32, layer_re
             except Exception as e:
                 print(f"\nError during model inference (Batch {i//batch_size + 1}). Problematic IDs might be: {batch_ids}")
                 print(f"Error: {e}")
-                continue # Skip batch on error
+                continue
 
         # Extract hidden states for the specified layer
         if not (0 <= layer_repr < len(outputs.hidden_states)):
@@ -379,7 +379,7 @@ def generate_embeddings(model, tokenizer, sequence_data, batch_size=32, layer_re
 
 
 # Clustering the embeddings
-def cluster_embeddings(embeddings, method, n_clusters=50, **kwargs):
+def cluster_embeddings(embeddings, method, **kwargs):
     """
         Cluster embeddings using specified method
     """
@@ -415,45 +415,6 @@ def cluster_embeddings(embeddings, method, n_clusters=50, **kwargs):
         except Exception as e:
              print(f"Error during DBSCAN clustering: {e}")
              exit(1)
-
-    elif method == 'agglomerative':
-        if n_samples <= 1:
-             print("Only <=1 sample, cannot perform agglomerative clustering. Assigning cluster label 0.")
-             return np.array([0]) if n_samples == 1 else np.array([])
-        # Use distance_threshold or n_clusters, prioritize threshold if both given
-        use_threshold = kwargs.get('distance_threshold') is not None
-        if use_threshold:
-            n_clusters_param = None
-            threshold_param = kwargs['distance_threshold']
-            print(f"  Using Agglomerative Clustering with distance_threshold={threshold_param:.4f} (cosine metric, average linkage)")
-            if threshold_param <= 0:
-                print("Error: distance_threshold must be positive for Agg Clustering.")
-                exit(1)
-        else:
-            n_clusters_param = n_clusters # Use n_clusters passed to function
-            threshold_param = None
-            print(f"  Using Agglomerative Clustering with n_clusters={n_clusters_param} (cosine metric, average linkage)")
-            if n_clusters_param <= 0:
-                print("Error: n_clusters must be positive if not using distance_threshold.")
-                exit(1)
-            if n_clusters_param > n_samples:
-                print(f"Warning: n_clusters ({n_clusters_param}) > n_samples ({n_samples}). Setting n_clusters to {n_samples}.")
-                n_clusters_param = n_samples
-
-        try:
-            clustering = AgglomerativeClustering(
-                n_clusters=n_clusters_param,
-                distance_threshold=threshold_param,
-                metric='cosine',
-                linkage='average'
-            )
-            labels = clustering.fit_predict(embeddings)
-            num_found_clusters = len(set(labels))
-            print(f"  Agglomerative clustering found {num_found_clusters} clusters.")
-        except Exception as e:
-            print(f"Error during Agglomerative clustering: {e}")
-            exit(1)
-
     else:
         print(f"Error: Unsupported clustering method '{method}'. Check --cluster_method argument.")
         exit(1)
@@ -528,7 +489,7 @@ def save_subset_to_parquet(id_list, df_full, r2_filesystem, r2_bucket, output_r2
     start_filter_write = time.time()
     subset_table = None
     try:
-        # Ensure IDs are strings for filtering if 'uniprot_id' is string type
+        # 'uniprot_id' is string type
         id_list_str = [str(id_val) for id_val in id_list]
         subset_df = df_full[df_full['uniprot_id'].isin(id_list_str)].copy()
 
@@ -613,28 +574,28 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # --- Input Validation ---
+    #  Input Validation 
     if not 0.0 < args.test_ratio < 1.0: print("Error: Test ratio invalid."); sys.exit(1)
     if args.batch_size <= 0: print("Error: batch_size invalid."); sys.exit(1)
     if args.max_len <= 0: print("Error: max_len invalid."); sys.exit(1)
     # Add detailed clustering param validation if needed
 
-    # --- Workflow ---
+    #  Workflow 
     script_start_time = time.time()
 
-    # 0. Setup R2 connection
+    # Setup R2 connection
     r2_bucket, r2_filesystem = setup_r2_fs(ENV_FILE_PATH)
 
-    # 1. Load sequence data and get full Dask DataFrame
+    # Load sequence data and get full Dask DataFrame
     sequence_data, df_full = load_data_from_parquet(r2_bucket, args.r2_input_path, r2_filesystem)
     if df_full is None:
         print("ERROR: Failed to load data, DataFrame is None.")
         sys.exit(1)
 
-    # 2. Load ESM Model
+    # Load ESM Model
     model, tokenizer, layer_repr, device = load_esm_model(args.esm_model)
 
-    # 3. Generate Embeddings
+    # Generate Embeddings
     embeddings, processed_ids, _ = generate_embeddings(
         model, tokenizer, sequence_data, args.batch_size, layer_repr, args.max_len, device=device
     )
@@ -646,7 +607,7 @@ if __name__ == "__main__":
     gc.collect()
     if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-    # 4. Save embeddings/IDs (Optional)
+    # Save embeddings/IDs
     if args.embeddings_out: 
         print(f"Saving embeddings to {args.embeddings_out}...")
         np.save(args.embeddings_out, embeddings)
@@ -655,26 +616,25 @@ if __name__ == "__main__":
         with open(args.ids_out, 'w') as f:
             for seq_id in processed_ids: f.write(str(seq_id) + '\n')
 
-    # 5. Cluster embeddings
+    # Cluster embeddings
     cluster_params = {}
-    if args.cluster_method == 'agglomerative':
-        cluster_params['n_clusters'] = args.n_clusters; cluster_params['distance_threshold'] = args.distance_threshold
-    elif args.cluster_method == 'dbscan':
-        cluster_params['eps'] = args.eps; cluster_params['min_samples'] = args.min_samples
+    if args.cluster_method == 'dbscan':
+        cluster_params['eps'] = args.eps
+        cluster_params['min_samples'] = args.min_samples
     cluster_labels = cluster_embeddings(embeddings, method=args.cluster_method, **cluster_params)
 
     # Clean up embeddings
     del embeddings
     gc.collect()
 
-    # 6. Split IDs based on clusters
+    # Split IDs based on clusters
     train_ids, test_ids = split_data_by_clusters(processed_ids, cluster_labels, args.test_ratio, args.seed)
 
     # Clean up labels and IDs
     del cluster_labels, processed_ids
     gc.collect()
 
-    # 7. Save output datasets by filtering Dask DF and writing Parquet subsets
+    # Save output datasets by filtering Dask DF and writing Parquet subsets
     save_subset_to_parquet(train_ids, df_full, r2_filesystem, r2_bucket, args.r2_train_path, schema=DATA_SCHEMA)
     save_subset_to_parquet(test_ids, df_full, r2_filesystem, r2_bucket, args.r2_test_path, schema=DATA_SCHEMA)
 

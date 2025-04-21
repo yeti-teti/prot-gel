@@ -14,7 +14,7 @@ import pyarrow.fs as pafs
 
 from dotenv import load_dotenv
 
-# --- Configuration ---
+# Configuration
 BASE_DATA_DIR = "../../data"
 INPUT_JSON_FILENAME = "integrated_data.json"
 
@@ -109,7 +109,7 @@ DATA_SCHEMA = pa.schema([
     pa.field('uniprot_id_prefix', pa.dictionary(pa.int8(), pa.string(), ordered=False), nullable=True)
 ])
 
-# --- Path Setup ---
+# Path Setup
 try:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     base_abs_path = os.path.abspath(os.path.join(script_dir, BASE_DATA_DIR))
@@ -118,7 +118,7 @@ except Exception as e:
     print(f"Error determining script directory or paths: {e}")
     sys.exit(1)
 
-# --- Load Environment Variables for R2 ---
+# Load Environment Variables for R2
 print(f"Loading R2 credentials from: {ENV_FILE_PATH}")
 if not load_dotenv(dotenv_path=ENV_FILE_PATH):
     print(f"Warning: .env file not found at {ENV_FILE_PATH}. Using system environment variables.")
@@ -170,9 +170,9 @@ def preprocess_nans(data):
          return None
     return data
 
-# --- Main Execution ---
+# Main Execution
 def main():
-    print("\n--- Starting JSON to R2 Parquet Upload Script ---")
+    print("\n--- Starting JSON to R2 Parquet Upload Script")
 
     start_time = time.time()
     initial_data_len = 0
@@ -190,10 +190,7 @@ def main():
             print("ERROR: JSON file is empty or contains no data.")
             sys.exit(1)
         initial_data_len = len(integrated_data)
-        print(f"Successfully loaded {len(integrated_data)} records from JSON.")
-    except json.JSONDecodeError as e:
-        print(f"ERROR: Failed to decode JSON file: {e}")
-        sys.exit(1)
+        print(f"Successfully loaded {len(integrated_data)} records from JSON.") 
     except Exception as e:
         print(f"ERROR: Failed to read JSON file: {e}")
         sys.exit(1)
@@ -226,10 +223,6 @@ def main():
         del integrated_data
         del data_list
         gc.collect()
-
-    except MemoryError:
-        print("\nERROR: Ran out of memory converting JSON dictionary to Pandas DataFrame.")
-        sys.exit(1)
     except Exception as e:
         print(f"ERROR: Failed during JSON to Pandas DataFrame conversion: {e}")
         sys.exit(1)
@@ -304,7 +297,7 @@ def main():
 
     # 7. Final Summary
     end_time = time.time()
-    print("\n--- Upload Summary ---")
+    print("\n--- Upload Summary")
     print(f"Input JSON records:      {initial_data_len}")
     print(f"Parquet dataset written: s3://{full_dataset_path}")
     print(f"Total time taken:      {end_time - start_time:.2f} seconds")

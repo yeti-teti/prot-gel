@@ -9,16 +9,16 @@ import pyarrow.dataset as ds
 import pyarrow.fs as pafs
 from dotenv import load_dotenv
 
-# --- Configuration ---
+#  Configuration 
 # Cloudflare R2 Configuration
 ENV_FILE_PATH = ".env"
-R2_BUCKET_NAME = os.getenv("CLOUDFARE_BUCKET_NAME") # Load from env if already set
+R2_BUCKET_NAME = os.getenv("CLOUDFARE_BUCKET_NAME") # Load from env 
 # Path WITHIN the R2 bucket where the partitioned dataset resides
 R2_DATASET_PATH_IN_BUCKET = "integrated_data/viridiplantae_dataset_partitioned_from_json"
 # Sample size
 SAMPLE_SIZE = 10
 
-# --- Load Environment Variables for R2 ---
+#  Load Environment Variables for R2 
 print(f"Loading R2 credentials from: {ENV_FILE_PATH}")
 if not load_dotenv(dotenv_path=ENV_FILE_PATH):
     print(f"Warning: .env file not found at {ENV_FILE_PATH}. Using system environment variables.")
@@ -36,7 +36,7 @@ if not R2_BUCKET_NAME:
 r2_endpoint = os.getenv("CLOUDFARE_ENDPOINT")
 
 
-# Construct endpoint from account ID if endpoint not explicitly set
+# Endpoint from account ID if endpoint not explicitly set
 if not r2_endpoint and r2_account_id:
     r2_endpoint = f"https://{r2_account_id}.r2.cloudflarestorage.com"
 elif not r2_endpoint and not r2_account_id:
@@ -57,12 +57,12 @@ print(f"Target R2 Dataset Path: {R2_DATASET_PATH_IN_BUCKET}")
 print(f"Using Full Path for PyArrow Calls: {FULL_R2_PATH}")
 print(f"Fetching sample size: {SAMPLE_SIZE}")
 
-# --- Main Execution ---
+#  Main Execution 
 def main():
-    print("\n--- Starting R2 Parquet Sample Read Script ---")
+    print("\n Starting R2 Parquet Sample Read Script ")
     start_time = time.time()
 
-    # 1. Configure R2 Filesystem Connection
+    # Configure R2 Filesystem Connection
     print("Configuring R2 filesystem connection...")
     try:
         r2_fs = pafs.S3FileSystem(
@@ -85,7 +85,7 @@ def main():
         print(f"ERROR: Failed to configure or test R2 filesystem connection: {e}")
         sys.exit(1)
 
-    # 2. Read Sample Data from Partitioned Parquet Dataset
+    # Read Sample Data from Partitioned Parquet Dataset
     print(f"\nReading sample data (first {SAMPLE_SIZE} rows) from partitioned dataset...")
     try:
         # Use pyarrow.dataset to read partitioned data
@@ -111,8 +111,8 @@ def main():
         # Common issues: incorrect path, partitioning scheme, permissions, credentials
         sys.exit(1)
 
-    # 3. Display Sample Data
-    print("\n--- Sample Data ---")
+    # Display Sample Data
+    print("\n Sample Data ")
     if not sample_df.empty:
         print(f"Shape of sample data: {sample_df.shape}")
         # Check if the partitioning column was included automatically
@@ -135,9 +135,9 @@ def main():
 
     # 4. Final Summary
     end_time = time.time()
-    print("\n--- Script Finished ---")
+    print("\n Script Finished ")
     print(f"Total time taken: {end_time - start_time:.2f} seconds")
-    print("-----------------------")
+    print("--")
 
 if __name__ == "__main__":
     main()

@@ -17,7 +17,7 @@ import pandas as pd
 from scipy.spatial import KDTree
 
 
-# --- Configuration ---
+# Configuration
 # Data Input Paths
 BASE_DATA_DIR = "../../data" 
 UNIPROT_FILE = "uniprotkb_viridiplantae.txt"
@@ -37,8 +37,8 @@ OUTPUT_PATH = os.path.join(BASE_DATA_DIR, INTEGRATED_JSON_FILE)
 DSSP_EXECUTABLE = "/opt/homebrew/bin/mkdssp" # Use the specific path provided
 HMMSCAN_EXECUTABLE = "hmmscan" # Keep for Pfam scan
 
-# --- Parallelism ---
-MAX_WORKERS = os.cpu_count() or 4
+# Parallelism
+MAX_WORKERS = os.cpu_count() 
 PROGRESS_INTERVAL = 100 # Report progress every N files
 
 # Constants
@@ -50,7 +50,7 @@ CONTACT_THRESHOLD = 8.0
 
 
 
-# --- AAIndex Setup ---
+# AAIndex Setup
 try:
     aa_idx = aaindex.AAIndex1()
     hydrophobicity = aa_idx['KYTJ820101']
@@ -285,7 +285,7 @@ def process_pdb_file(pdb_filepath, dssp_exec):
     }
 
     try:
-        # --- Parse PDB Structure ---
+        # Parse PDB Structure
         parser = PDBParser(QUIET=True)
         structure = parser.get_structure(pdb_id_from_filename, pdb_filepath)
         if not structure or len(structure) == 0:
@@ -294,7 +294,7 @@ def process_pdb_file(pdb_filepath, dssp_exec):
              return [(uid, structural_feature) for uid in uniprot_ids_in_file]
         model = structure[0]
 
-        # --- Run DSSP ---
+        # Run DSSP
         dssp_data = []
         try:
             dssp = DSSP(model, pdb_filepath, dssp=dssp_exec)
@@ -310,7 +310,7 @@ def process_pdb_file(pdb_filepath, dssp_exec):
             structural_feature["processing_error"] = f"DSSP execution failed: {error_detail}"
             # Don't stop processing geometry if DSSP failed, but record error
 
-        # --- Process DSSP Results ---
+        # Process DSSP Results
         residue_details = []
         helix_count, sheet_count, total_residues = 0, 0, 0
         if dssp_data:
@@ -338,7 +338,7 @@ def process_pdb_file(pdb_filepath, dssp_exec):
              structural_feature["processing_error"] = "DSSP returned no data"
 
 
-        # --- Calculate CA Coordinates and Contact Map ---
+        # Calculate CA Coordinates and Contact Map
         ca_coordinates = []
         contact_map_indices = []
         try:
@@ -423,9 +423,9 @@ def integrate_data(uniprot_data, pfam_data, structure_data_map):
     return uniprot_data
 
 
-# --- Main Execution ---
+# Main Execution
 def main():
-    print("--- Starting Streamlined Protein Data Integration (JSON Output) ---")
+    print("--- Starting Streamlined Protein Data Integration (JSON Output)")
     overall_start_time = time.time()
 
     # Step 1: Parse UniProt Data (.txt file format assumed)
@@ -442,7 +442,7 @@ def main():
          # Let's create a temporary fasta file if run_hmmscan_and_parse needs it
          # Or modify run_hmmscan_and_parse if it can take sequence data directly (unlikely for external tool)
 
-         # --- Create temp FASTA for hmmscan ---
+         # Create temp FASTA for hmmscan
          temp_fasta_path = None
          try:
               with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".fasta") as temp_fasta:
@@ -463,14 +463,14 @@ def main():
               if temp_fasta_path and os.path.exists(temp_fasta_path):
                   try: os.remove(temp_fasta_path)
                   except OSError: print(f"Warning: Could not remove temp FASTA file {temp_fasta_path}")
-         # --- End temp FASTA ---
+         # End temp FASTA
 
     else:
         print(f"Warning: Pfam HMM DB not found: {HMM_PATH}. Skipping domain parsing.")
 
 
     # Step 3: Process PDB files from 'complete_pdb' directory (Parallel DSSP etc.)
-    print(f"\n--- Processing PDB Structures from '{COMPLETE_PDB_DIR}' ---")
+    print(f"\n--- Processing PDB Structures from '{COMPLETE_PDB_DIR}'")
     pdb_process_start_time = time.time()
     combined_pdb_data = {} # Maps uniprot_id -> list of structural_feature dicts
     processed_pdb_count = 0
@@ -533,7 +533,7 @@ def main():
 
 
     # Step 5: Save Final Integrated Data to JSON
-    print(f"\n--- Saving Integrated Data to JSON ---")
+    print(f"\n--- Saving Integrated Data to JSON")
     if not integrated_data:
          print("ERROR: No integrated data produced. Skipping JSON save.")
     else:
@@ -551,7 +551,7 @@ def main():
               print(f"ERROR: Could not write integrated data JSON: {e}")
 
     overall_end_time = time.time()
-    print("\n--- Pipeline Finished ---")
+    print("\n--- Pipeline Finished")
     print(f"Total execution time: {overall_end_time - overall_start_time:.2f} seconds")
 
 

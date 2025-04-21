@@ -5,6 +5,7 @@ import gzip
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
+import concurrent.futures
 import sys
 
 
@@ -12,12 +13,10 @@ BASE_DATA_DIR = "../../data"  # Adjust if your base 'data' directory is elsewher
 INPUT_FOLDER_NAME = "alphafold_sp_pdb"
 OUTPUT_FOLDER_NAME = "alphafold_sp_pdb_extracted" # Name for the new output folder
 
-# Maximum number of parallel extraction processes (adjust based on your CPU cores and disk speed)
-# None will use os.cpu_count() * 5 by default which is often too high for I/O tasks
-# Start with the number of CPU cores or slightly more.
-MAX_WORKERS = os.cpu_count() or 6 # Use number of CPU cores as a starting point
 
-# --- Path Setup ---
+MAX_WORKERS = os.cpu_count() 
+
+#  Path Setup 
 try:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     base_abs_path = os.path.abspath(os.path.join(script_dir, BASE_DATA_DIR))
@@ -29,7 +28,7 @@ except Exception as e:
     sys.exit(1)
 
 
-# --- Helper Function for Extraction ---
+#  Helper Function for Extraction 
 def extract_pdb_gz(gz_filepath, output_dir):
     """
     Extracts a single .pdb.gz file to the output directory.
@@ -69,9 +68,9 @@ def extract_pdb_gz(gz_filepath, output_dir):
     except Exception as e:
         return False, f"Failed to extract {gz_filepath}: {e}"
 
-# --- Main Execution ---
+#  Main Execution 
 def main():
-    print("--- Starting PDB.GZ Extraction Script ---")
+    print(" Starting PDB.GZ Extraction Script ")
     start_time = time.time()
 
     # 1. Validate Input Directory
@@ -84,7 +83,7 @@ def main():
     try:
         os.makedirs(output_dir_path, exist_ok=True)
         print(f"Output directory: {output_dir_path}")
-        # Check if writable (basic check)
+        # Check if writable 
         test_file = os.path.join(output_dir_path, ".write_test")
         with open(test_file, "w") as f: f.write("test")
         os.remove(test_file)
@@ -146,13 +145,12 @@ def main():
 
     # 5. Final Summary
     end_time = time.time()
-    print("--- Extraction Summary ---")
+    print(" Extraction Summary ")
     print(f"Successfully extracted: {extracted_count}")
     print(f"Failed/Errors:        {error_count}")
     print(f"Total files processed:  {files_processed}")
     print(f"Total time taken:     {end_time - start_time:.2f} seconds")
-    print("--------------------------")
+    print("--")
 
-if __name__ == "__main__":
-    import concurrent.futures # Make sure it's imported for the main block too
+if __name__ == "__main__": 
     main()
