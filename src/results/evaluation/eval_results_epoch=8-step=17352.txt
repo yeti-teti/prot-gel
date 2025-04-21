@@ -1,0 +1,5 @@
+Evaluation Results for model: results/training_run_20250421_012836/epoch=8-step=17352.ckpt
+Test data R2 path: integrated_data/test_split_parquet
+Test Loss: 0.0184
+Accuracy: 0.9918 (4113/4147)
+AUC: 0.9997
