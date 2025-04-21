@@ -172,7 +172,7 @@ def preprocess_nans(data):
 
 # Main Execution
 def main():
-    print("\n--- Starting JSON to R2 Parquet Upload Script")
+    print("\nStarting JSON to R2 Parquet Upload Script")
 
     start_time = time.time()
     initial_data_len = 0
